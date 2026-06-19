@@ -1,0 +1,28 @@
+# requirements.txt
+# Python packages for AI Forex Pro
+
+# Web framework
+fastapi==0.109.0
+uvicorn==0.24.0
+python-multipart==0.0.6
+websockets==12.0
+
+# Data & ML
+pandas
+numpy
+ta==0.11.0
+scikit-learn
+tensorflow-CPU
+
+# APIs
+aiohttp==3.9.1
+redis==5.0.1
+
+# Notifications
+sendgrid==6.11.0
+twilio==8.10.0
+
+# Utilities
+python-dotenv==1.0.0
+ccxt
+httpx>=0.24.0

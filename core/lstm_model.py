@@ -20,9 +20,9 @@ class UniversalLSTMPredictor:
         self.sequence_length = sequence_length
         self.prediction_horizon = prediction_horizon
         
-        # Ensure model directory is in the project root
+        # PRODUCTION FIX: Use current working directory to locate the folder
         if model_path is None:
-            self.model_path = Path(__file__).resolve().parent.parent / "models_new"
+            self.model_path = Path(os.getcwd()) / "models_new"
         else:
             self.model_path = Path(model_path)
             
@@ -86,7 +86,6 @@ class UniversalLSTMPredictor:
 
         history = self.model.fit(X[:split_idx], y[:split_idx], epochs=epochs, batch_size=64, validation_data=(X[split_idx:], y[split_idx:]), verbose=1)
         
-        # FORCED SAVE: Ensure files exist and are not empty
         self.model.save(str(h5_path))
         joblib.dump(self.scaler, str(scaler_path))
         

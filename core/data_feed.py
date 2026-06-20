@@ -23,6 +23,7 @@ class DataFeedManager:
 
     async def _fetch_from_kraken(self, pair: str) -> Optional[pd.DataFrame]:
         logger.info(f"Attempting to fetch {pair} from Kraken...")
+        # Note: Kraken pair names often need internal formatting (e.g., XXBTZUSD for BTC/USD)
         url = f"https://api.kraken.com/0/public/OHLC?pair={pair}"
         try:
             async with aiohttp.ClientSession() as session:
@@ -33,20 +34,37 @@ class DataFeedManager:
                     
                     json_data = await response.json()
                     
-                    # --- THE FIX ---
-                    # 1. Check if 'result' exists
+                    # --- FIXED DATA EXTRACTION ---
                     if 'result' in json_data:
-                        # 2. Extract the specific pair key, e.g., 'XETHZUSD'
-                        # You may need to print(json_data['result'].keys()) to see the exact key
+                        # Kraken returns a dict where the key is the pair name (e.g., 'XXBTZUSD')
+                        # We get the first key dynamically to ensure we get the data
                         data_key = list(json_data['result'].keys())[0]
                         raw_data = json_data['result'][data_key]
                         
-                        # 3. Create DataFrame from the cleaned list
-                        return pd.DataFrame(raw_data)
+                        # Define column names based on Kraken OHLCVT format
+                        columns = ['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'trades']
+                        
+                        # Convert to DataFrame
+                        df = pd.DataFrame(raw_data, columns=columns)
+                        
+                        # Ensure numeric types
+                        for col in ['open', 'high', 'low', 'close', 'volume']:
+                            df[col] = pd.to_numeric(df[col])
+                            
+                        return df
                     else:
                         logger.error(f"❌ Kraken Error: 'result' key missing in response: {json_data}")
                         return None
                         
         except Exception as e:
             logger.error(f"❌ Kraken Exception for {pair}: {str(e)}")
+            return None
+
+    async def _fetch_from_deriv(self, pair: str) -> Optional[pd.DataFrame]:
+        logger.info(f"Attempting to fetch {pair} from Deriv...")
+        try:
+            # Add your actual Deriv API logic here
+            return None
+        except Exception as e:
+            logger.error(f"❌ Deriv Exception for {pair}: {str(e)}")
             return None

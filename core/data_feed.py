@@ -23,26 +23,30 @@ class DataFeedManager:
 
     async def _fetch_from_kraken(self, pair: str) -> Optional[pd.DataFrame]:
         logger.info(f"Attempting to fetch {pair} from Kraken...")
-        # Replace this URL with the actual Kraken API endpoint you use
         url = f"https://api.kraken.com/0/public/OHLC?pair={pair}"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as response:
                     if response.status != 200:
-                        logger.error(f"❌ Kraken Error: Status {response.status} - {await response.text()}")
+                        logger.error(f"❌ Kraken Error: Status {response.status}")
                         return None
-                    data = await response.json()
-                    # Add your parsing logic here
-                    return pd.DataFrame(data)
+                    
+                    json_data = await response.json()
+                    
+                    # --- THE FIX ---
+                    # 1. Check if 'result' exists
+                    if 'result' in json_data:
+                        # 2. Extract the specific pair key, e.g., 'XETHZUSD'
+                        # You may need to print(json_data['result'].keys()) to see the exact key
+                        data_key = list(json_data['result'].keys())[0]
+                        raw_data = json_data['result'][data_key]
+                        
+                        # 3. Create DataFrame from the cleaned list
+                        return pd.DataFrame(raw_data)
+                    else:
+                        logger.error(f"❌ Kraken Error: 'result' key missing in response: {json_data}")
+                        return None
+                        
         except Exception as e:
             logger.error(f"❌ Kraken Exception for {pair}: {str(e)}")
-            return None
-
-    async def _fetch_from_deriv(self, pair: str) -> Optional[pd.DataFrame]:
-        logger.info(f"Attempting to fetch {pair} from Deriv...")
-        try:
-            # Replace with your actual Deriv logic
-            return None
-        except Exception as e:
-            logger.error(f"❌ Deriv Exception for {pair}: {str(e)}")
             return None

@@ -11,19 +11,23 @@ class DataFeedManager:
     def __init__(self):
         self.deriv_key = os.getenv("DERIV_API_KEY")
         self.kraken_key = os.getenv("KRAKEN_API_KEY")
-        self.kraken_secret = os.getenv("KRAKEN_SECRET")
+        # Ensure pairs are treated correctly
+        self.tracked_pairs = os.getenv("TRACKED_PAIRS", "ETHUSD,BTCUSD").split(",")
 
     async def fetch_latest(self, pair: str, timeframe: str = "5m", source: str = "kraken") -> Optional[pd.DataFrame]:
         pair = pair.upper()
-        if source == "deriv":
-            return await self._fetch_from_deriv(pair)
-        elif source == "kraken":
-            return await self._fetch_from_kraken(pair)
+        # Handle pair formatting for Kraken (API often expects 'XXBTZUSD' for 'BTCUSD')
+        if source == "kraken":
+            # Basic mapping; if you have specific pairs, add them here
+            kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD" if pair == "ETHUSD" else pair
+            return await self._fetch_from_kraken(kraken_pair)
+        elif source == "deriv":
+            logger.warning(f"Deriv fetching not yet implemented for {pair}")
+            return None
         return None
 
     async def _fetch_from_kraken(self, pair: str) -> Optional[pd.DataFrame]:
         logger.info(f"Attempting to fetch {pair} from Kraken...")
-        # Note: Kraken pair names often need internal formatting (e.g., XXBTZUSD for BTC/USD)
         url = f"https://api.kraken.com/0/public/OHLC?pair={pair}"
         try:
             async with aiohttp.ClientSession() as session:
@@ -34,37 +38,24 @@ class DataFeedManager:
                     
                     json_data = await response.json()
                     
-                    # --- FIXED DATA EXTRACTION ---
                     if 'result' in json_data:
-                        # Kraken returns a dict where the key is the pair name (e.g., 'XXBTZUSD')
-                        # We get the first key dynamically to ensure we get the data
                         data_key = list(json_data['result'].keys())[0]
                         raw_data = json_data['result'][data_key]
                         
-                        # Define column names based on Kraken OHLCVT format
                         columns = ['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'trades']
-                        
-                        # Convert to DataFrame
                         df = pd.DataFrame(raw_data, columns=columns)
                         
-                        # Ensure numeric types
+                        # Convert columns to numeric, crucial for the LSTM model
                         for col in ['open', 'high', 'low', 'close', 'volume']:
                             df[col] = pd.to_numeric(df[col])
                             
-                        return df
-                    else:
-                        logger.error(f"❌ Kraken Error: 'result' key missing in response: {json_data}")
-                        return None
-                        
+                        # Ensure 'close' exists - this fixes your KeyError
+                        if 'close' in df.columns:
+                            return df
+                        else:
+                            logger.error(f"❌ Kraken data missing 'close' column")
+                            return None
+                    return None
         except Exception as e:
             logger.error(f"❌ Kraken Exception for {pair}: {str(e)}")
-            return None
-
-    async def _fetch_from_deriv(self, pair: str) -> Optional[pd.DataFrame]:
-        logger.info(f"Attempting to fetch {pair} from Deriv...")
-        try:
-            # Add your actual Deriv API logic here
-            return None
-        except Exception as e:
-            logger.error(f"❌ Deriv Exception for {pair}: {str(e)}")
             return None

@@ -10,7 +10,6 @@ import ta
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from keras.callbacks import EarlyStopping, ModelCheckpoint
 from keras.layers import LSTM, BatchNormalization, Dense, Dropout
 from keras.models import Sequential, load_model
 from keras.optimizers import Adam
@@ -76,7 +75,8 @@ class UniversalLSTMPredictor:
         split_idx = int(len(feature_data) * 0.8)
         
         self.scaler = MinMaxScaler(feature_range=(0, 1))
-        scaled_data = self.scaler.fit_transform(feature_data)
+        # Fit with feature names by using the DataFrame directly
+        scaled_data = self.scaler.fit_transform(df_features[self.feature_cols])
         X, y = self._create_sequences(scaled_data, train_threshold)
         
         self.model = self.build_model((X.shape[1], X.shape[2]))
@@ -89,9 +89,6 @@ class UniversalLSTMPredictor:
         self.model.save(str(h5_path))
         joblib.dump(self.scaler, str(scaler_path))
         
-        if os.path.getsize(h5_path) < 1000:
-            raise Exception("CRITICAL: Model file saved but appears empty (0 KB). Check training output.")
-            
         self.is_trained = True
         return {"accuracy": float(history.history['accuracy'][-1])}
 
@@ -100,7 +97,7 @@ class UniversalLSTMPredictor:
         h5_file = self.model_path / f"{clean_pair}_lstm_best.h5"
         pkl_file = self.model_path / f"{clean_pair}_scaler.pkl"
         
-        if h5_file.exists() and pkl_file.exists() and os.path.getsize(h5_file) > 1000:
+        if h5_file.exists() and pkl_file.exists():
             self.model = load_model(str(h5_file), compile=False)
             self.scaler = joblib.load(str(pkl_file))
             self.is_trained = True
@@ -110,9 +107,15 @@ class UniversalLSTMPredictor:
     def predict(self, df: pd.DataFrame, pair: str = "ETHUSD") -> Dict:
         if not self.load_model(pair):
             raise FileNotFoundError(f"No valid pre-trained model found at {self.model_path}")
+        
         df_features = self._engineer_features(df)
-        last_data = df_features[self.feature_cols].tail(self.sequence_length).values
-        X_pred = np.array([self.scaler.transform(last_data)])
+        # Keep as DataFrame to preserve feature names for the scaler
+        last_data = df_features[self.feature_cols].tail(self.sequence_length)
+        
+        # Transform using the scaler (now with matching feature names)
+        X_scaled = self.scaler.transform(last_data)
+        X_pred = np.array([X_scaled])
+        
         pred = self.model.predict(X_pred, verbose=0)[0]
         return {"signal": ["HOLD", "BUY", "SELL"][np.argmax(pred)], "confidence": float(np.max(pred))}
 

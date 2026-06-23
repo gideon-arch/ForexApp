@@ -1,4 +1,5 @@
-# main.py - AI Crypto Signal Bot (Production Ready)
+# Also update main.py to use the original config (Deriv for BTC, Kraken for ETH)
+main_py = '''# main.py - AI Crypto Signal Bot (Production Ready)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -8,7 +9,6 @@ import asyncio
 import redis.asyncio as redis
 import json
 import logging
-import gc
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
     redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
-    logger.info(f"Redis connected")
+    logger.info("Redis connected")
 except Exception as e:
     logger.warning(f"Redis connection failed: {e}")
     redis_client = None
@@ -98,6 +98,7 @@ def check_candlestick_reversal(df_candles, signal_type: str, pair: str) -> bool:
 
 class CloudForexEngine:
     def __init__(self):
+        # Original config: Deriv for BTCUSD, Kraken for ETHUSD
         self.pairs_config = {
             "BTCUSD": {"source": "deriv", "tf": "5m", "check_interval": 60},
             "ETHUSD": {"source": "kraken", "tf": "5m", "check_interval": 60}
@@ -111,7 +112,7 @@ class CloudForexEngine:
         self.filter_managers = {}
         self.predictors = {}
         self.analyzer = TechnicalAnalyzer()
-        logger.info("CloudForexEngine initialized")
+        logger.info("CloudForexEngine initialized | Deriv for BTCUSD, Kraken for ETHUSD")
 
     async def initialize(self):
         logger.info("Initializing Engine...")
@@ -143,7 +144,7 @@ class CloudForexEngine:
         try:
             logger.info(f"Auto-training {pair} model...")
             config = self.pairs_config[pair]
-            df = await self.data_feed.fetch_historical(pair, timeframe=config['tf'], limit=1000)
+            df = await self.data_feed.fetch_historical(pair, timeframe=config['tf'], source=config['source'], limit=1000)
             if df is None or len(df) < 300:
                 logger.error(f"Not enough data to train {pair}")
                 return False
@@ -345,3 +346,9 @@ if __name__ == "__main__":
         workers=1,
         loop="asyncio"
     )
+'''
+
+with open('/mnt/agents/output/forex_bot/main.py', 'w') as f:
+    f.write(main_py)
+
+print("✅ main.py updated - Deriv for BTCUSD, Kraken for ETHUSD")

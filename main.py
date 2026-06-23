@@ -1,5 +1,4 @@
-# Also update main.py to use the original config (Deriv for BTC, Kraken for ETH)
-main_py = '''# main.py - AI Crypto Signal Bot (Production Ready)
+# main.py - AI Crypto Signal Bot (Production Ready)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -346,9 +345,3 @@ if __name__ == "__main__":
         workers=1,
         loop="asyncio"
     )
-'''
-
-with open('/mnt/agents/output/forex_bot/main.py', 'w') as f:
-    f.write(main_py)
-
-print("✅ main.py updated - Deriv for BTCUSD, Kraken for ETHUSD")

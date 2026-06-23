@@ -1,5 +1,4 @@
-# Updated data_feed.py - Deriv for BTCUSD, Kraken for ETHUSD
-data_feed_py = '''# core/data_feed.py
+# core/data_feed.py
 # Data fetcher - Deriv for BTCUSD, Kraken for ETHUSD
 
 import os
@@ -206,11 +205,3 @@ class DataFeedManager:
         logger.warning(f"Deriv failed for {pair}, falling back to Kraken")
         kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
         return await self._fetch_from_kraken(kraken_pair, timeframe, limit)
-'''
-
-with open('/mnt/agents/output/forex_bot/core/data_feed.py', 'w') as f:
-    f.write(data_feed_py)
-
-print("✅ core/data_feed.py updated - Deriv for BTCUSD, Kraken for ETHUSD")
-print("   - Added detailed logging for Deriv API")
-print("   - Added fallback to Kraken if Deriv fails")

@@ -1,61 +1,100 @@
 # core/lstm_model.py
+# LSTM Ensemble Predictor
+
 import os
-import shutil
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import joblib
 import numpy as np
 import pandas as pd
 import ta
-import tensorflow as tf
+import logging
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import LSTM, BatchNormalization, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+    logging.warning("TensorFlow not available. LSTM disabled.")
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from keras.layers import LSTM, BatchNormalization, Dense, Dropout
-from keras.models import Sequential, load_model
-from keras.optimizers import Adam
+
+logger = logging.getLogger(__name__)
 
 class UniversalLSTMPredictor:
+    FEATURE_COLS = [
+        "open", "high", "low", "close", "volume",
+        "rsi", "macd", "macd_signal", "macd_hist",
+        "bb_upper", "bb_middle", "bb_lower",
+        "atr", "adx", "obv", "returns", "volatility"
+    ]
+    
     def __init__(self, sequence_length: int = 60, prediction_horizon: int = 5, model_path: str = None):
         self.sequence_length = sequence_length
         self.prediction_horizon = prediction_horizon
-        
-        # PRODUCTION FIX: Use current working directory to locate the folder
-        if model_path is None:
-            self.model_path = Path(os.getcwd()) / "models_new"
-        else:
-            self.model_path = Path(model_path)
-            
-        os.makedirs(self.model_path, exist_ok=True)
+        self.model_path = Path(model_path) if model_path else Path(os.getcwd()) / "models_new"
+        self.model_path.mkdir(parents=True, exist_ok=True)
         self.threshold = float(os.getenv("LSTM_THRESHOLD_PERCENT", 0.1)) / 100
         self.model = None
         self.scaler = None
         self.is_trained = False
-        self.feature_cols = ["open", "high", "low", "close", "volume", "rsi", "macd", "macd_signal", "macd_hist", "bb_upper", "bb_middle", "bb_lower", "atr", "adx", "obv", "returns", "volatility"]
+        logger.info(f"LSTM Predictor | Seq: {sequence_length} | Path: {self.model_path}")
 
     def _engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df["returns"] = df["close"].pct_change()
-        df["volatility"] = df["returns"].rolling(window=20).std()
-        df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+        df["volatility"] = df["returns"].rolling(window=20, min_periods=1).std().fillna(0)
+        df["rsi"] = ta.momentum.rsi(df["close"], window=14).fillna(50)
+        
         macd = ta.trend.MACD(df["close"])
-        df["macd"], df["macd_signal"], df["macd_hist"] = macd.macd(), macd.macd_signal(), macd.macd_diff()
+        df["macd"] = macd.macd().fillna(0)
+        df["macd_signal"] = macd.macd_signal().fillna(0)
+        df["macd_hist"] = macd.macd_diff().fillna(0)
+        
         bb = ta.volatility.BollingerBands(df["close"])
-        df["bb_upper"], df["bb_middle"], df["bb_lower"] = bb.bollinger_hband(), bb.bollinger_mavg(), bb.bollinger_lband()
-        df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"])
-        df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"])
-        df["obv"] = ta.volume.on_balance_volume(df["close"], df["volume"]) if "volume" in df.columns else 0
-        return df.dropna()
+        df["bb_upper"] = bb.bollinger_hband().fillna(df["close"])
+        df["bb_middle"] = bb.bollinger_mavg().fillna(df["close"])
+        df["bb_lower"] = bb.bollinger_lband().fillna(df["close"])
+        
+        df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"]).fillna(0)
+        df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"]).fillna(25)
+        
+        if "volume" in df.columns and df["volume"].sum() > 0:
+            df["obv"] = ta.volume.on_balance_volume(df["close"], df["volume"]).fillna(0)
+        else:
+            df["obv"] = 0.0
+        
+        for col in self.FEATURE_COLS:
+            if col not in df.columns:
+                df[col] = 0.0
+        
+        df.dropna(inplace=True)
+        return df
 
     def _create_sequences(self, data: np.ndarray, threshold: float) -> Tuple[np.ndarray, np.ndarray]:
         X, y = [], []
         for i in range(len(data) - self.sequence_length - self.prediction_horizon):
-            X.append(data[i : (i + self.sequence_length)])
-            future_return = (data[i + self.sequence_length + self.prediction_horizon - 1, 3] - data[i + self.sequence_length - 1, 3]) / data[i + self.sequence_length - 1, 3]
-            label = 1 if future_return > threshold else (2 if future_return < -threshold else 0)
+            X.append(data[i:(i + self.sequence_length)])
+            future_price = data[i + self.sequence_length + self.prediction_horizon - 1, 3]
+            current_price = data[i + self.sequence_length - 1, 3]
+            future_return = (future_price - current_price) / current_price if current_price > 0 else 0
+            
+            if future_return > threshold: label = 1
+            elif future_return < -threshold: label = 2
+            else: label = 0
+            
             y.append(label)
+        
         return np.array(X), np.array(y)
 
-    def build_model(self, input_shape: Tuple[int, int]) -> Sequential:
+    def build_model(self, input_shape: Tuple[int, int]):
+        if not TF_AVAILABLE:
+            raise RuntimeError("TensorFlow not available")
+        
         model = Sequential([
             LSTM(128, return_sequences=True, input_shape=input_shape),
             BatchNormalization(), Dropout(0.3),
@@ -65,67 +104,143 @@ class UniversalLSTMPredictor:
             BatchNormalization(), Dropout(0.2),
             Dense(3, activation="softmax")
         ])
-        model.compile(optimizer=Adam(learning_rate=0.001), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+        
+        model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"]
+        )
         return model
 
-    def train(self, df: pd.DataFrame, pair: str, epochs: int = 35) -> Dict:
-        train_threshold = max(self.threshold, 0.005) if "BTC" in pair.upper() or "ETH" in pair.upper() else self.threshold
-        df_features = self._engineer_features(df)
-        feature_data = df_features[self.feature_cols].values
-        split_idx = int(len(feature_data) * 0.8)
+    def train(self, df: pd.DataFrame, pair: str, epochs: int = 25) -> Dict:
+        if not TF_AVAILABLE:
+            return {"error": "TensorFlow not available", "accuracy": 0.0}
         
+        logger.info(f"Training {pair} model...")
+        train_threshold = max(self.threshold, 0.005) if any(x in pair.upper() for x in ["BTC", "ETH"]) else self.threshold
+        
+        df_features = self._engineer_features(df)
+        if len(df_features) < self.sequence_length + 50:
+            return {"error": f"Insufficient data: {len(df_features)} rows", "accuracy": 0.0}
+        
+        feature_data = df_features[self.FEATURE_COLS].values
         self.scaler = MinMaxScaler(feature_range=(0, 1))
-        # Fit with feature names by using the DataFrame directly
-        scaled_data = self.scaler.fit_transform(df_features[self.feature_cols])
+        scaled_data = self.scaler.fit_transform(feature_data)
+        
         X, y = self._create_sequences(scaled_data, train_threshold)
+        if len(X) < 50:
+            return {"error": f"Insufficient sequences: {len(X)}", "accuracy": 0.0}
+        
+        split_idx = int(len(X) * 0.8)
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
         
         self.model = self.build_model((X.shape[1], X.shape[2]))
-        clean_pair = pair.replace("/", "")
-        h5_path = self.model_path / f"{clean_pair}_lstm_best.h5"
-        scaler_path = self.model_path / f"{clean_pair}_scaler.pkl"
-
-        history = self.model.fit(X[:split_idx], y[:split_idx], epochs=epochs, batch_size=64, validation_data=(X[split_idx:], y[split_idx:]), verbose=1)
         
-        self.model.save(str(h5_path))
-        joblib.dump(self.scaler, str(scaler_path))
+        history = self.model.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=min(64, len(X_train)),
+            validation_data=(X_val, y_val),
+            verbose=0
+        )
+        
+        clean_pair = pair.replace("/", "").upper()
+        model_file = self.model_path / f"{clean_pair}_lstm.keras"
+        scaler_file = self.model_path / f"{clean_pair}_scaler.pkl"
+        
+        self.model.save(str(model_file))
+        joblib.dump(self.scaler, str(scaler_file))
         
         self.is_trained = True
-        return {"accuracy": float(history.history['accuracy'][-1])}
+        accuracy = float(history.history['accuracy'][-1]) if 'accuracy' in history.history else 0.0
+        
+        logger.info(f"{pair} model trained | Accuracy: {accuracy:.2%}")
+        return {"accuracy": accuracy}
 
     def load_model(self, pair: str) -> bool:
-        clean_pair = pair.replace("/", "").upper()
-        h5_file = self.model_path / f"{clean_pair}_lstm_best.h5"
-        pkl_file = self.model_path / f"{clean_pair}_scaler.pkl"
+        if not TF_AVAILABLE:
+            return False
         
-        if h5_file.exists() and pkl_file.exists():
-            self.model = load_model(str(h5_file), compile=False)
-            self.scaler = joblib.load(str(pkl_file))
-            self.is_trained = True
+        if self.is_trained and self.model is not None:
             return True
+        
+        clean_pair = pair.replace("/", "").upper()
+        model_file = self.model_path / f"{clean_pair}_lstm.keras"
+        scaler_file = self.model_path / f"{clean_pair}_scaler.pkl"
+        
+        if not model_file.exists():
+            model_file = self.model_path / f"{clean_pair}_lstm_best.h5"
+        
+        if model_file.exists() and scaler_file.exists():
+            try:
+                self.model = load_model(str(model_file), compile=False)
+                self.scaler = joblib.load(str(scaler_file))
+                self.is_trained = True
+                logger.info(f"Loaded model for {pair}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to load model for {pair}: {e}")
+                return False
+        
+        logger.warning(f"No model found for {pair}")
         return False
 
     def predict(self, df: pd.DataFrame, pair: str = "ETHUSD") -> Dict:
-        if not self.load_model(pair):
-            raise FileNotFoundError(f"No valid pre-trained model found at {self.model_path}")
+        if not TF_AVAILABLE or not self.is_trained or self.model is None:
+            return {"signal": "HOLD", "confidence": 0.0, "reason": "Model not available"}
         
-        df_features = self._engineer_features(df)
-        # Keep as DataFrame to preserve feature names for the scaler
-        last_data = df_features[self.feature_cols].tail(self.sequence_length)
-        
-        # Transform using the scaler (now with matching feature names)
-        X_scaled = self.scaler.transform(last_data)
-        X_pred = np.array([X_scaled])
-        
-        pred = self.model.predict(X_pred, verbose=0)[0]
-        return {"signal": ["HOLD", "BUY", "SELL"][np.argmax(pred)], "confidence": float(np.max(pred))}
+        try:
+            df_features = self._engineer_features(df)
+            if len(df_features) < self.sequence_length:
+                return {"signal": "HOLD", "confidence": 0.0, "reason": f"Need {self.sequence_length} rows, got {len(df_features)}"}
+            
+            last_data = df_features[self.FEATURE_COLS].tail(self.sequence_length)
+            X_scaled = self.scaler.transform(last_data)
+            X_pred = np.array([X_scaled])
+            
+            pred = self.model.predict(X_pred, verbose=0)[0]
+            signal_idx = np.argmax(pred)
+            confidence = float(pred[signal_idx])
+            signal = ["HOLD", "BUY", "SELL"][signal_idx]
+            
+            return {
+                "signal": signal,
+                "confidence": confidence,
+                "raw_probs": {"HOLD": float(pred[0]), "BUY": float(pred[1]), "SELL": float(pred[2])}
+            }
+            
+        except Exception as e:
+            logger.error(f"Prediction error for {pair}: {e}")
+            return {"signal": "HOLD", "confidence": 0.0, "reason": str(e)}
 
 class EnsemblePredictor:
     def __init__(self):
         self.lstm = UniversalLSTMPredictor()
         self.weights = {"lstm": 0.4, "technical": 0.35, "fundamental": 0.25}
-
+    
     def predict(self, df: pd.DataFrame, tech_score: float, fund_score: float, pair: str) -> Dict:
         lstm_pred = self.lstm.predict(df, pair=pair)
-        score = ({"SELL": -1, "HOLD": 0, "BUY": 1}[lstm_pred["signal"]] * lstm_pred["confidence"] * self.weights["lstm"]) + (tech_score * self.weights["technical"]) + (fund_score * self.weights["fundamental"])
-        final_signal = "BUY" if score > 0.1 else ("SELL" if score < -0.1 else "HOLD")
-        return {"signal": final_signal, "confidence": float(lstm_pred["confidence"])}
+        
+        signal_map = {"SELL": -1, "HOLD": 0, "BUY": 1}
+        lstm_score = signal_map.get(lstm_pred["signal"], 0) * lstm_pred["confidence"]
+        
+        ensemble_score = (
+            lstm_score * self.weights["lstm"] +
+            tech_score * self.weights["technical"] +
+            fund_score * self.weights["fundamental"]
+        )
+        
+        if ensemble_score > 0.15: final_signal = "BUY"
+        elif ensemble_score < -0.15: final_signal = "SELL"
+        else: final_signal = "HOLD"
+        
+        final_confidence = max(lstm_pred["confidence"], abs(ensemble_score))
+        
+        return {
+            "signal": final_signal,
+            "confidence": float(final_confidence),
+            "ensemble_score": float(ensemble_score),
+            "lstm": lstm_pred,
+            "technical_score": float(tech_score)
+        }

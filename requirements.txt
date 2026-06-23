@@ -1,29 +1,14 @@
-# requirements.txt
-# Python packages for AI Forex Pro
-
-# Web framework
-fastapi==0.109.0
+Fastapi==0.109.0
 uvicorn==0.24.0
 python-multipart==0.0.6
-websockets==12.0
-
-# Data & ML
-pandas
-numpy
+pandas==2.1.4
+numpy==1.26.3
 ta==0.11.0
-scikit-learn
-tensorflow-CPU
-
-# APIs
+scikit-learn==1.4.0
+tensorflow
+joblib==1.3.2
 aiohttp==3.9.1
+httpx==0.26.0
+requests==2.31.0
 redis==5.0.1
-
-# Notifications
-sendgrid==6.11.0
-twilio==8.10.0
-
-# Utilities
 python-dotenv==1.0.0
-ccxt
-httpx>=0.24.0
-joblib==1.3.0

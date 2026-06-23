@@ -1,6 +1,8 @@
-# main.py - FULL PRODUCTION UPDATE
+# ==================== IMPROVED main.py ====================
+main_py = '''# main.py - AI Crypto Signal Bot (Production Ready)
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 import sys
 import asyncio
@@ -8,11 +10,8 @@ import redis.asyncio as redis
 import json
 import logging
 import gc
-import pandas as pd
-import httpx
-import time
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -24,7 +23,7 @@ from core.lstm_model import EnsemblePredictor
 from core.notifications import NotificationManager, SignalAlert
 
 # =====================================================================
-# 🧠 TENSORFLOW ENVIRONMENT GUARD
+# 🧠 TENSORFLOW ENVIRONMENT GUARD (CPU-Only for Render Free Tier)
 # =====================================================================
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -42,120 +41,334 @@ try:
 except Exception:
     pass
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# =====================================================================
+# 📝 LOGGING SETUP
+# =====================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
+# =====================================================================
+# 🔌 REDIS CONNECTION
+# =====================================================================
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
-redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
-
-app_state = {'is_running': False, 'engine': None}
+try:
+    redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+    logger.info(f"✅ Redis connected: {redis_url.split('@')[-1] if '@' in redis_url else redis_url}")
+except Exception as e:
+    logger.warning(f"⚠️ Redis connection failed: {e}. Running without cache.")
+    redis_client = None
 
 # =====================================================================
-# 🕯️ GEOMETRIC CANDLESTICK REVERSAL PATTERN SCANNER
+# 🌍 APP STATE
 # =====================================================================
-def check_candlestick_reversal(df_candles: pd.DataFrame, signal_type: str, pair: str, is_scalp_track: bool = False) -> bool:
+app_state = {'is_running': False, 'engine': None, 'last_signals': {}}
+
+# =====================================================================
+# 🕯️ CANDLESTICK REVERSAL PATTERN SCANNER
+# =====================================================================
+def check_candlestick_reversal(df_candles, signal_type: str, pair: str) -> bool:
+    """
+    Check for candlestick reversal patterns to confirm signals.
+    Returns True if pattern supports the signal, False if it contradicts.
+    """
     try:
-        if df_candles is None or len(df_candles) < 4: return True
+        if df_candles is None or len(df_candles) < 4:
+            return True  # Not enough data, allow signal
+        
         df = df_candles.copy()
         df.columns = [col.lower() for col in df.columns]
-        c1 = df.iloc[-2]; c2 = df.iloc[-3]
-        open_1, high_1, low_1, close_1 = float(c1['open']), float(c1['high']), float(c1['low']), float(c1['close'])
-        open_2, high_2, low_2, close_2 = float(c2['open']), float(c2['high']), float(c2['low']), float(c2['close'])
-        body_1 = abs(close_1 - open_1); range_1 = high_1 - low_1 if (high_1 - low_1) > 0 else 0.0001
-        is_green_1 = close_1 > open_1; is_red_1 = open_1 > close_1; is_red_2 = open_2 > close_2; is_green_2 = close_2 > open_2
+        
+        c1 = df.iloc[-2]  # Previous candle
+        c2 = df.iloc[-3]  # Candle before that
+        
+        open_1 = float(c1['open'])
+        high_1 = float(c1['high'])
+        low_1 = float(c1['low'])
+        close_1 = float(c1['close'])
+        
+        open_2 = float(c2['open'])
+        high_2 = float(c2['high'])
+        low_2 = float(c2['low'])
+        close_2 = float(c2['close'])
+        
+        body_1 = abs(close_1 - open_1)
+        range_1 = high_1 - low_1 if (high_1 - low_1) > 0 else 0.0001
+        
+        is_green_1 = close_1 > open_1
+        is_red_1 = open_1 > close_1
+        is_red_2 = open_2 > close_2
+        is_green_2 = close_2 > open_2
         
         if signal_type == "BUY":
-            if is_red_1: return False
-            if is_green_1 and is_red_2 and (abs(close_2 - open_2) > (body_1 * 2)): return False
+            # Reject if last candle is red (bearish)
+            if is_red_1:
+                return False
+            
+            # Reject if strong bearish engulfing
+            if is_green_1 and is_red_2 and (abs(close_2 - open_2) > (body_1 * 2)):
+                return False
+            
+            # Confirm if long lower wick (hammer)
             lower_wick_1 = min(open_1, close_1) - low_1
-            if lower_wick_1 >= (2 * body_1): return True
-            if is_green_1 and is_red_2 and close_1 >= open_2 and open_1 <= close_2: return True
+            if lower_wick_1 >= (2 * body_1):
+                return True
+            
+            # Confirm if bullish engulfing
+            if is_green_1 and is_red_2 and close_1 >= open_2 and open_1 <= close_2:
+                return True
+                
         elif signal_type == "SELL":
-            if is_green_1: return False
+            # Reject if last candle is green (bullish)
+            if is_green_1:
+                return False
+            
+            # Confirm if long upper wick (shooting star)
             upper_wick_1 = high_1 - max(open_1, close_1)
-            if upper_wick_1 >= (2 * body_1): return True
-            if is_red_1 and is_green_2 and close_1 <= open_2 and open_1 >= close_2: return True
+            if upper_wick_1 >= (2 * body_1):
+                return True
+            
+            # Confirm if bearish engulfing
+            if is_red_1 and is_green_2 and close_1 <= open_2 and open_1 >= close_2:
+                return True
+        
+        return True  # Default: allow signal
+    except Exception as e:
+        logger.warning(f"Candlestick check error: {e}")
         return True
-    except: return True
 
 # =====================================================================
-# 🛸 CLOUD FOREX ENGINE
+# 🚀 CLOUD FOREX ENGINE (FIXED PIPELINE)
 # =====================================================================
 class CloudForexEngine:
     def __init__(self):
         self.pairs_config = {
-            "ETHUSD": {"source": "kraken", "tf": "5m", "check_interval": 60},
-            "BTCUSD": {"source": "deriv", "tf": "5m", "check_interval": 60}
+            "BTCUSD": {"source": "deriv", "tf": "5m", "check_interval": 60},
+            "ETHUSD": {"source": "kraken", "tf": "5m", "check_interval": 60}
         }
         self.tasks = {}
         self.health = {}
         self.last_sent_signal = {pair: None for pair in self.pairs_config}
-        self.threshold = float(os.getenv('LSTM_THRESHOLD_PERCENT', 0.1)) / 100
+        self.threshold = float(os.getenv('LSTM_THRESHOLD_PERCENT', '0.1')) / 100
+        
         self.data_feed = None
         self.notification_manager = None
         self.filter_managers = {}
         self.predictors = {}
         self.analyzer = TechnicalAnalyzer()
+        
+        logger.info("🚀 CloudForexEngine initialized")
     
     async def initialize(self):
-        logger.info("🚀 Initializing Engine with Source-Specific Routing...")
+        """Initialize all components with proper error handling."""
+        logger.info("🔧 Initializing Engine...")
+        
         try:
             self.data_feed = DataFeedManager()
-            self.notification_manager = NotificationManager({
-                'gmail_user': os.getenv('FROM_EMAIL'), 'gmail_password': os.getenv('GMAIL_APP_PASSWORD'),
-                'twilio_sid': os.getenv('TWILIO_SID'), 'twilio_token': os.getenv('TWILIO_TOKEN'),
-                'twilio_from_number': os.getenv('TWILIO_FROM'), 'from_email': os.getenv('FROM_EMAIL')
-            })
+            self.notification_manager = NotificationManager()
+            
             for pair in self.pairs_config:
                 self.filter_managers[pair] = FilterManager()
                 self.predictors[pair] = EnsemblePredictor()
-                # Loading model with explicit error reporting
-                try:
-                    self.predictors[pair].lstm.load_model(pair)
-                    logger.info(f"✅ Loaded model for {pair}")
-                except Exception as e:
-                    logger.error(f"❌ Critical: Could not load model for {pair}: {e}")
-                self.health[pair] = {'status': 'initializing', 'last_check': None, 'signals_today': 0}
+                
+                # Try to load pre-trained model
+                model_loaded = self.predictors[pair].lstm.load_model(pair)
+                
+                if not model_loaded:
+                    logger.warning(f"⚠️ No model found for {pair}. Will train on live data...")
+                    # Auto-train if model missing (first run)
+                    await self._auto_train_model(pair)
+                else:
+                    logger.info(f"✅ Model loaded for {pair}")
+                
+                self.health[pair] = {
+                    'status': 'initializing',
+                    'last_check': None,
+                    'signals_today': 0,
+                    'last_signal': None
+                }
+            
             app_state['is_running'] = True
+            logger.info("✅ Engine initialization complete!")
+            
         except Exception as e:
-            logger.error(f"❌ Failed to initialize engine: {e}")
-            raise e
+            logger.error(f"❌ Engine initialization failed: {e}")
+            raise
+    
+    async def _auto_train_model(self, pair: str):
+        """Auto-train model using live data if no pre-trained model exists."""
+        try:
+            logger.info(f"🎓 Auto-training {pair} model...")
+            config = self.pairs_config[pair]
+            
+            # Fetch historical data for training
+            df = await self.data_feed.fetch_historical(pair, timeframe=config['tf'], limit=1000)
+            
+            if df is None or len(df) < 300:
+                logger.error(f"❌ Not enough data to train {pair}. Need 300+ candles, got {len(df) if df is not None else 0}")
+                return False
+            
+            # Train the model
+            result = self.predictors[pair].lstm.train(df, pair, epochs=20)
+            logger.info(f"✅ {pair} model trained! Accuracy: {result.get('accuracy', 'N/A')}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Auto-training failed for {pair}: {e}")
+            return False
     
     async def monitor_pair(self, pair: str):
+        """Main monitoring loop for a trading pair."""
         config = self.pairs_config[pair]
+        logger.info(f"👁️ Starting monitor for {pair} ({config['source']})")
+        
         while app_state['is_running']:
             try:
-                # Adding timeout to network requests to prevent hanging
+                start_time = asyncio.get_event_loop().time()
+                
+                # 1. FETCH DATA (with timeout)
                 df = await asyncio.wait_for(
-                    self.data_feed.fetch_latest(pair, timeframe=config['tf'], source=config['source']), 
-                    timeout=15.0
+                    self.data_feed.fetch_latest(pair, timeframe=config['tf'], source=config['source']),
+                    timeout=20.0
                 )
+                
                 if df is None or df.empty:
-                    logger.warning(f"⚠️ No data received for {pair}")
-                    await asyncio.sleep(10); continue
+                    logger.warning(f"⚠️ No data for {pair}")
+                    await asyncio.sleep(15)
+                    continue
                 
-                indicators = self.analyzer.calculate_indicators(df)
-                prediction = self.predictors[pair].predict(df, self.analyzer.generate_technical_score(indicators), 0.0, pair)
+                if len(df) < 200:
+                    logger.warning(f"⚠️ Insufficient data for {pair}: {len(df)} candles (need 200+)")
+                    await asyncio.sleep(15)
+                    continue
                 
+                # 2. TECHNICAL ANALYSIS
+                try:
+                    indicators = self.analyzer.calculate_indicators(df)
+                except Exception as e:
+                    logger.warning(f"⚠️ Technical analysis failed for {pair}: {e}")
+                    await asyncio.sleep(10)
+                    continue
+                
+                current_price = indicators['current_price']
+                tech_score = self.analyzer.generate_technical_score(indicators)
+                
+                # 3. LSTM PREDICTION
+                try:
+                    prediction = self.predictors[pair].predict(
+                        df, 
+                        tech_score=tech_score,
+                        fund_score=0.0,  # No fundamental data for crypto
+                        pair=pair
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ LSTM prediction failed for {pair}: {e}")
+                    prediction = {"signal": "HOLD", "confidence": 0.0}
+                
+                lstm_signal = prediction['signal']
+                lstm_confidence = prediction['confidence']
+                
+                # 4. FILTER VALIDATION (SMC + Anti-Spam)
+                if lstm_signal in ['BUY', 'SELL'] and lstm_confidence >= 0.6:
+                    filter_passed, filter_report = self.filter_managers[pair].validate_signal(
+                        df, lstm_signal, current_price
+                    )
+                    
+                    if filter_passed:
+                        # 5. CANDLESTICK CONFIRMATION
+                        candle_ok = check_candlestick_reversal(df, lstm_signal, pair)
+                        
+                        if candle_ok:
+                            # 6. BUILD SIGNAL ALERT
+                            alert = SignalAlert(
+                                pair=pair,
+                                signal=lstm_signal,
+                                price=current_price,
+                                confidence=lstm_confidence,
+                                timestamp=datetime.utcnow(),
+                                reasoning=indicators.get('smc_reasoning', 'AI Pattern Recognition'),
+                                target=indicators.get('suggested_take_profit'),
+                                stop_loss=indicators.get('suggested_stop_loss'),
+                                urgency='high' if lstm_confidence > 0.85 else 'normal'
+                            )
+                            
+                            # 7. SEND NOTIFICATION
+                            await self.notification_manager.send_telegram_alert(alert)
+                            
+                            # 8. SAVE TO REDIS
+                            signal_data = {
+                                'pair': pair,
+                                'signal': lstm_signal,
+                                'price': current_price,
+                                'confidence': lstm_confidence,
+                                'timestamp': datetime.utcnow().isoformat(),
+                                'target': indicators.get('suggested_take_profit'),
+                                'stop_loss': indicators.get('suggested_stop_loss'),
+                                'reasoning': indicators.get('smc_reasoning', '')
+                            }
+                            
+                            if redis_client:
+                                await redis_client.setex(
+                                    f"signal:{pair}:current",
+                                    3600,  # 1 hour TTL
+                                    json.dumps(signal_data)
+                                )
+                            
+                            # Update tracking
+                            self.last_sent_signal[pair] = lstm_signal
+                            self.health[pair]['signals_today'] += 1
+                            self.health[pair]['last_signal'] = signal_data
+                            
+                            logger.info(f"🎯 SIGNAL SENT: {pair} {lstm_signal} @ {current_price:.2f} (conf: {lstm_confidence:.2%})")
+                        else:
+                            logger.info(f"🕯️ Candlestick rejected {lstm_signal} for {pair}")
+                    else:
+                        reason = filter_report.get('filters', {}).get('cooldown_check', {}).get('reason', 'Filter blocked')
+                        logger.info(f"🛡️ Filter blocked {lstm_signal} for {pair}: {reason}")
+                else:
+                    # Log HOLD state periodically
+                    if self.health[pair].get('last_check') is None or \
+                       (asyncio.get_event_loop().time() - self.health[pair]['last_check']) > 300:
+                        logger.info(f"⏸️ {pair}: HOLD (LSTM conf: {lstm_confidence:.2%}, Tech score: {tech_score:.3f})")
+                
+                # Update health
                 self.health[pair]['status'] = 'healthy'
-                await asyncio.sleep(5) 
+                self.health[pair]['last_check'] = asyncio.get_event_loop().time()
+                
+                # Calculate sleep to maintain interval
+                elapsed = asyncio.get_event_loop().time() - start_time
+                sleep_time = max(5, config['check_interval'] - elapsed)
+                await asyncio.sleep(sleep_time)
+                
             except asyncio.TimeoutError:
-                logger.error(f"❌ Connection Timeout for {pair}. Retrying...")
-                await asyncio.sleep(10)
+                logger.error(f"❌ Timeout fetching {pair}. Retrying in 20s...")
+                await asyncio.sleep(20)
             except Exception as e:
                 logger.error(f"❌ Error in {pair} loop: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)
     
     async def start(self):
         await self.initialize()
         for pair in self.pairs_config:
             self.tasks[pair] = asyncio.create_task(self.monitor_pair(pair))
+            await asyncio.sleep(2)  # Stagger starts to avoid rate limits
     
     async def stop(self):
         app_state['is_running'] = False
-        for task in self.tasks.values(): task.cancel()
-        await redis_client.close()
+        for task in self.tasks.values():
+            task.cancel()
+        if redis_client:
+            await redis_client.close()
+        logger.info("🛑 Engine stopped")
 
+# =====================================================================
+# 🌐 FASTAPI APP
+# =====================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     engine = CloudForexEngine()
@@ -164,19 +377,83 @@ async def lifespan(app: FastAPI):
     yield
     await engine.stop()
 
-app = FastAPI(title="AI Crypto Pro", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(
+    title="AI Crypto Signal Bot",
+    description="BTCUSD & ETHUSD pattern prediction with Telegram alerts",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+@app.get("/")
+async def root():
+    return {
+        "status": "running" if app_state['is_running'] else "down",
+        "pairs": list(app_state.get('engine', {}).pairs_config.keys() if app_state.get('engine') else []),
+        "version": "2.0.0"
+    }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy" if app_state['is_running'] else "down"}
+    engine = app_state.get('engine')
+    if not engine:
+        return {"status": "down", "error": "Engine not initialized"}
+    
+    return {
+        "status": "healthy" if app_state['is_running'] else "down",
+        "pairs": {
+            pair: {
+                "status": info['status'],
+                "signals_today": info['signals_today'],
+                "last_signal": info.get('last_signal')
+            }
+            for pair, info in engine.health.items()
+        }
+    }
 
 @app.get("/api/signal/{pair}")
 async def get_signal(pair: str):
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available")
+    
     data = await redis_client.get(f"signal:{pair.upper()}:current")
-    if not data: raise HTTPException(status_code=404, detail="No signal")
+    if not data:
+        raise HTTPException(status_code=404, detail=f"No active signal for {pair}")
+    
     return json.loads(data)
+
+@app.get("/api/signals")
+async def get_all_signals():
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available")
+    
+    signals = {}
+    for pair in ["BTCUSD", "ETHUSD"]:
+        data = await redis_client.get(f"signal:{pair}:current")
+        if data:
+            signals[pair] = json.loads(data)
+    
+    return signals
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        reload=False,
+        workers=1,
+        loop="asyncio"
+    )
+'''
+
+with open('/mnt/agents/output/forex_bot/main.py', 'w') as f:
+    f.write(main_py)
+
+print("✅ main.py created")

@@ -1,11 +1,16 @@
 # core/data_feed.py
-# Multi-source data fetcher with fallback and caching
+# Multi-source data fetcher with API authentication
 
+import os
 import aiohttp
 import pandas as pd
 import logging
 from typing import Optional
 from datetime import datetime
+import time
+import hmac
+import hashlib
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +18,14 @@ class DataFeedManager:
     def __init__(self):
         self.cache = {}
         self.cache_ttl = 30
+        
+        # API Keys from environment
+        self.deriv_api_key = os.getenv('DERIV_API_KEY')
+        self.deriv_account_id = os.getenv('DERIV_ACCOUNT_ID')
+        self.kraken_api_key = os.getenv('KRAKEN_API_KEY')
+        self.kraken_secret = os.getenv('KRAKEN_SECRET')
+        
+        logger.info("DataFeedManager initialized")
 
     async def fetch_latest(self, pair: str, timeframe: str = "5m", source: str = "kraken") -> Optional[pd.DataFrame]:
         pair = pair.upper()
@@ -25,18 +38,24 @@ class DataFeedManager:
         
         try:
             if source.lower() == "deriv":
-                df = await self._fetch_from_deriv(pair, timeframe)
+                df = await self._fetch_from_deriv_authenticated(pair, timeframe)
             elif source.lower() == "kraken":
                 kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
-                df = await self._fetch_from_kraken(kraken_pair, timeframe)
+                df = await self._fetch_from_kraken_authenticated(kraken_pair, timeframe)
             else:
+                logger.error(f"Unknown source: {source}")
                 return None
             
             if df is not None and len(df) >= 200:
                 self.cache[cache_key] = (datetime.now(), df)
+                logger.info(f"Fetched {len(df)} candles for {pair} from {source}")
                 return df
-            return df
-            
+            elif df is not None and len(df) > 0:
+                logger.warning(f"Only {len(df)} candles for {pair} (need 200+)")
+                return df
+            else:
+                return None
+                
         except Exception as e:
             logger.error(f"Error fetching {pair}: {e}")
             return None
@@ -45,28 +64,40 @@ class DataFeedManager:
         pair = pair.upper()
         try:
             if source.lower() == "deriv":
-                return await self._fetch_from_deriv(pair, timeframe, limit)
+                return await self._fetch_from_deriv_authenticated(pair, timeframe, limit)
             elif source.lower() == "kraken":
                 kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
-                return await self._fetch_from_kraken(kraken_pair, timeframe, limit)
-            return None
+                return await self._fetch_from_kraken_authenticated(kraken_pair, timeframe, limit)
+            else:
+                return None
         except Exception as e:
             logger.error(f"Historical fetch error: {e}")
             return None
 
-    async def _fetch_from_kraken(self, pair: str, timeframe: str = "5m", limit: int = 720) -> Optional[pd.DataFrame]:
+    async def _fetch_from_kraken_authenticated(self, pair: str, timeframe: str = "5m", limit: int = 720) -> Optional[pd.DataFrame]:
+        """Fetch from Kraken using public API (no auth needed for OHLC)"""
         interval_map = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
         interval = interval_map.get(timeframe, 5)
-        url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"
+        
+        url = "https://api.kraken.com/0/public/OHLC"
+        params = {
+            'pair': pair,
+            'interval': interval
+        }
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=15) as response:
+                async with session.get(url, params=params, timeout=15) as response:
                     if response.status != 200:
+                        logger.error(f"Kraken HTTP {response.status}")
                         return None
+                    
                     json_data = await response.json()
+                    
                     if 'error' in json_data and json_data['error']:
+                        logger.error(f"Kraken API error: {json_data['error']}")
                         return None
+                    
                     if 'result' not in json_data:
                         return None
                     
@@ -83,34 +114,59 @@ class DataFeedManager:
                     
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
                     df.dropna(inplace=True)
+                    
                     return df
+                    
         except Exception as e:
-            logger.error(f"Kraken error: {e}")
+            logger.error(f"Kraken fetch error: {e}")
             return None
 
-    async def _fetch_from_deriv(self, pair: str, timeframe: str = "5m", limit: int = 1000) -> Optional[pd.DataFrame]:
-        deriv_symbol = f"{pair[:3]}/{pair[3:]}"
-        granularity_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
-        granularity = granularity_map.get(timeframe, 300)
-        url = f"https://api.deriv.com/api/ticks_history?ticks_history={deriv_symbol}&granularity={granularity}&count={limit}&end=latest&style=candles"
+    async def _fetch_from_deriv_authenticated(self, pair: str, timeframe: str = "5m", limit: int = 1000) -> Optional[pd.DataFrame]:
+        """Fetch from Deriv using WebSocket/REST API"""
+        # Deriv uses a simpler REST API for ticks
+        deriv_symbol = f"{pair[:3]}/{pair[3:]}"  # BTC/USD format
+        
+        # Try the ticks endpoint first
+        url = "https://ticks.deriv.com/api/v1/ticks_history"
+        params = {
+            'ticks_history': deriv_symbol,
+            'granularity': 300,
+            'count': min(limit, 5000),
+            'end': 'latest',
+            'style': 'candles'
+        }
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=15) as response:
+                headers = {}
+                if self.deriv_api_key:
+                    headers['Authorization'] = f'Bearer {self.deriv_api_key}'
+                
+                async with session.get(url, params=params, headers=headers, timeout=15) as response:
                     if response.status != 200:
-                        kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
-                        return await self._fetch_from_kraken(kraken_pair, timeframe, limit)
+                        logger.warning(f"Deriv HTTP {response.status}, trying fallback")
+                        return await self._fetch_from_deriv_fallback(pair, timeframe, limit)
+                    
+                    content_type = response.headers.get('content-type', '')
+                    if 'application/json' not in content_type:
+                        logger.warning(f"Deriv returned {content_type}, trying fallback")
+                        return await self._fetch_from_deriv_fallback(pair, timeframe, limit)
                     
                     json_data = await response.json()
+                    
                     if 'candles' not in json_data:
-                        kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
-                        return await self._fetch_from_kraken(kraken_pair, timeframe, limit)
+                        logger.warning("No candles in Deriv response, trying fallback")
+                        return await self._fetch_from_deriv_fallback(pair, timeframe, limit)
                     
                     candles = json_data['candles']
                     df = pd.DataFrame(candles)
+                    
                     df.rename(columns={
-                        'epoch': 'timestamp', 'open': 'open', 'high': 'high',
-                        'low': 'low', 'close': 'close'
+                        'epoch': 'timestamp',
+                        'open': 'open',
+                        'high': 'high',
+                        'low': 'low',
+                        'close': 'close'
                     }, inplace=True)
                     
                     if 'volume' not in df.columns:
@@ -121,8 +177,15 @@ class DataFeedManager:
                     
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
                     df.dropna(inplace=True)
+                    
                     return df
+                    
         except Exception as e:
-            logger.error(f"Deriv error: {e}")
-            kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
-            return await self._fetch_from_kraken(kraken_pair, timeframe, limit)
+            logger.error(f"Deriv error: {e}, trying fallback")
+            return await self._fetch_from_deriv_fallback(pair, timeframe, limit)
+
+    async def _fetch_from_deriv_fallback(self, pair: str, timeframe: str = "5m", limit: int = 1000) -> Optional[pd.DataFrame]:
+        """Fallback to Kraken if Deriv fails"""
+        logger.info("Using Kraken as fallback for Deriv")
+        kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
+        return await self._fetch_from_kraken_authenticated(kraken_pair, timeframe, limit)

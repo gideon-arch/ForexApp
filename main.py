@@ -315,30 +315,6 @@ async def health_check():
         }
     }
 
-@app.get("/test-telegram")
-async def test_telegram():
-    engine = app_state.get('engine')
-    if not engine or not engine.notification_manager:
-        raise HTTPException(status_code=500, detail="Engine or NotificationManager not initialized")
-    
-    try:
-        from core.notifications import SignalAlert
-        from datetime import datetime
-        
-        test_alert = SignalAlert(
-            pair="TEST",
-            signal="TEST_SIGNAL",
-            price=0.0,
-            confidence=1.0,
-            timestamp=datetime.utcnow(),
-            reasoning="Connection test from FastAPI /test-telegram endpoint."
-        )
-        await engine.notification_manager.send_telegram_alert(test_alert)
-        return {"status": "success", "message": "Test message sent to Telegram"}
-    except Exception as e:
-        logger.error(f"Test message failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/signal/{pair}")
 async def get_signal(pair: str):
     if not redis_client:

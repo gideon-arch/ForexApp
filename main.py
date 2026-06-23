@@ -97,7 +97,6 @@ def check_candlestick_reversal(df_candles, signal_type: str, pair: str) -> bool:
 
 class CloudForexEngine:
     def __init__(self):
-        # Original config: Deriv for BTCUSD, Kraken for ETHUSD
         self.pairs_config = {
             "BTCUSD": {"source": "deriv", "tf": "5m", "check_interval": 60},
             "ETHUSD": {"source": "kraken", "tf": "5m", "check_interval": 60}
@@ -194,7 +193,8 @@ class CloudForexEngine:
                 lstm_signal = prediction['signal']
                 lstm_confidence = prediction['confidence']
                 
-                if lstm_signal in ['BUY', 'SELL'] and lstm_confidence >= 0.6:
+                # CHANGED: Confidence threshold lowered from 0.6 to 0.5
+                if lstm_signal in ['BUY', 'SELL'] and lstm_confidence >= 0.5:
                     filter_passed, filter_report = self.filter_managers[pair].validate_signal(
                         df, lstm_signal, current_price
                     )
@@ -232,14 +232,15 @@ class CloudForexEngine:
                             self.health[pair]['last_signal'] = signal_data
                             logger.info(f"SIGNAL SENT: {pair} {lstm_signal} @ {current_price:.2f} (conf: {lstm_confidence:.2%})")
                         else:
-                            logger.info(f"Candlestick rejected {lstm_signal} for {pair}")
+                            # NEW: Filter debug log
+                            logger.info(f"FILTER DEBUG: {pair} {lstm_signal} rejected by Candle Reversal Check.")
                     else:
+                        # NEW: Filter debug log
                         reason = filter_report.get('filters', {}).get('cooldown_check', {}).get('reason', 'Filter blocked')
-                        logger.info(f"Filter blocked {lstm_signal} for {pair}: {reason}")
+                        logger.info(f"FILTER DEBUG: {pair} {lstm_signal} rejected. Reason: {reason}")
                 else:
-                    if self.health[pair].get('last_check') is None or \
-                       (asyncio.get_event_loop().time() - self.health[pair]['last_check']) > 300:
-                        logger.info(f"{pair}: HOLD (LSTM conf: {lstm_confidence:.2%}, Tech score: {tech_score:.3f})")
+                    # NEW: Log when confidence is too low
+                    logger.info(f"FILTER DEBUG: {pair} signal {lstm_signal} rejected. Confidence too low: {lstm_confidence:.2f}")
                 
                 self.health[pair]['status'] = 'healthy'
                 self.health[pair]['last_check'] = asyncio.get_event_loop().time()

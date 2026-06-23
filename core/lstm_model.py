@@ -231,11 +231,12 @@ class EnsemblePredictor:
             fund_score * self.weights["fundamental"]
         )
         
-        if ensemble_score > 0.15: final_signal = "BUY"
-        elif ensemble_score < -0.15: final_signal = "SELL"
+        # CHANGED: Threshold lowered to 0.08 for increased sensitivity
+        if ensemble_score > 0.08: final_signal = "BUY"
+        elif ensemble_score < -0.08: final_signal = "SELL"
         else: final_signal = "HOLD"
         
-        final_confidence = max(lstm_pred["confidence"], abs(ensemble_score))
+        final_confidence = min(max(lstm_pred["confidence"], abs(ensemble_score) * 2), 1.0)
         
         return {
             "signal": final_signal,

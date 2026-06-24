@@ -1,4 +1,6 @@
 # main.py - AI Crypto Signal Bot (Production Ready)
+# PREDICTIVE VERSION — Signals BEFORE the move, not after
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -60,36 +62,33 @@ def check_candlestick_reversal(df_candles, signal_type: str, pair: str) -> bool:
     try:
         if df_candles is None or len(df_candles) < 4:
             return True
+        
         df = df_candles.copy()
         df.columns = [col.lower() for col in df.columns]
         c1 = df.iloc[-2]
-        c2 = df.iloc[-3]
         open_1 = float(c1['open'])
         high_1 = float(c1['high'])
         low_1 = float(c1['low'])
         close_1 = float(c1['close'])
-        open_2 = float(c2['open'])
-        high_2 = float(c2['high'])
-        low_2 = float(c2['low'])
-        close_2 = float(c2['close'])
         body_1 = abs(close_1 - open_1)
-        range_1 = high_1 - low_1 if (high_1 - low_1) > 0 else 0.0001
+        total_range = high_1 - low_1 if (high_1 - low_1) > 0 else 0.0001
         is_green_1 = close_1 > open_1
         is_red_1 = open_1 > close_1
-        is_red_2 = open_2 > close_2
-        is_green_2 = close_2 > open_2
         
         if signal_type == "BUY":
-            if is_red_1: return False
-            if is_green_1 and is_red_2 and (abs(close_2 - open_2) > (body_1 * 2)): return False
-            lower_wick_1 = min(open_1, close_1) - low_1
-            if lower_wick_1 >= (2 * body_1): return True
-            if is_green_1 and is_red_2 and close_1 >= open_2 and open_1 <= close_2: return True
+            if is_green_1: 
+                return True
+            if body_1 < total_range * 0.3:
+                return True
+            return False
+            
         elif signal_type == "SELL":
-            if is_green_1: return False
-            upper_wick_1 = high_1 - max(open_1, close_1)
-            if upper_wick_1 >= (2 * body_1): return True
-            if is_red_1 and is_green_2 and close_1 <= open_2 and open_1 >= close_2: return True
+            if is_red_1:
+                return True
+            if body_1 < total_range * 0.3:
+                return True
+            return False
+            
         return True
     except Exception as e:
         logger.warning(f"Candlestick check error: {e}")
@@ -104,7 +103,7 @@ class CloudForexEngine:
         self.tasks = {}
         self.health = {}
         self.last_sent_signal = {pair: None for pair in self.pairs_config}
-        self.threshold = float(os.getenv('LSTM_THRESHOLD_PERCENT', '0.1')) / 100
+        self.threshold = float(os.getenv('LSTM_THRESHOLD_PERCENT', '0.05')) / 100
         self.data_feed = None
         self.notification_manager = None
         self.filter_managers = {}
@@ -193,10 +192,9 @@ class CloudForexEngine:
                 lstm_signal = prediction['signal']
                 lstm_confidence = prediction['confidence']
                 
-                # CHANGED: Confidence threshold lowered from 0.6 to 0.5
-                if lstm_signal in ['BUY', 'SELL'] and lstm_confidence >= 0.5:
+                if lstm_signal in ['BUY', 'SELL'] and lstm_confidence >= 0.4:
                     filter_passed, filter_report = self.filter_managers[pair].validate_signal(
-                        df, lstm_signal, current_price
+                        df, lstm_signal, current_price, pair=pair
                     )
                     if filter_passed:
                         candle_ok = check_candlestick_reversal(df, lstm_signal, pair)
@@ -232,14 +230,11 @@ class CloudForexEngine:
                             self.health[pair]['last_signal'] = signal_data
                             logger.info(f"SIGNAL SENT: {pair} {lstm_signal} @ {current_price:.2f} (conf: {lstm_confidence:.2%})")
                         else:
-                            # NEW: Filter debug log
                             logger.info(f"FILTER DEBUG: {pair} {lstm_signal} rejected by Candle Reversal Check.")
                     else:
-                        # NEW: Filter debug log
                         reason = filter_report.get('filters', {}).get('cooldown_check', {}).get('reason', 'Filter blocked')
                         logger.info(f"FILTER DEBUG: {pair} {lstm_signal} rejected. Reason: {reason}")
                 else:
-                    # NEW: Log when confidence is too low
                     logger.info(f"FILTER DEBUG: {pair} signal {lstm_signal} rejected. Confidence too low: {lstm_confidence:.2f}")
                 
                 self.health[pair]['status'] = 'healthy'

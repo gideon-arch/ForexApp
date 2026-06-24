@@ -1,5 +1,5 @@
 # core/technical_analysis.py
-# SMC Strategy: Structure -> S/R -> Liquidity Sweep -> RSI Confirm -> Entry
+# PREDICTIVE SMC Strategy — Signals BEFORE the move, not after
 
 import os
 from typing import Dict, Optional, Tuple
@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 class TechnicalAnalyzer:
     def __init__(self):
-        self.rsi_buy_low = float(os.getenv("RSI_BUY_LOW", 30))
-        self.rsi_sell_high = float(os.getenv("RSI_SELL_HIGH", 65))
+        self.rsi_buy_low = float(os.getenv("RSI_BUY_LOW", 40))
+        self.rsi_sell_high = float(os.getenv("RSI_SELL_HIGH", 60))
         self.rsi_midpoint = (self.rsi_buy_low + self.rsi_sell_high) / 2
         self.rsi_range_half = max(self.rsi_sell_high - self.rsi_midpoint, 1.0)
         logger.info(f"TechnicalAnalyzer | RSI: {self.rsi_buy_low}-{self.rsi_sell_high}")
@@ -69,8 +69,13 @@ class TechnicalAnalyzer:
         elif current_rsi >= 70.0: rsi_zone = "EXTREME_OVERBOUGHT"
         elif current_rsi >= self.rsi_sell_high: rsi_zone = "OVERBOUGHT"
         
+        # PREDICTIVE: Calculate RSI momentum (is it turning?)
+        rsi_momentum = self._calculate_rsi_momentum(df)
+        price_momentum = self._calculate_price_momentum(df)
+        
         confluence_score, target_signal, reasoning = self._calculate_confluence(
-            trend, sweep_type, sweep_quality, current_rsi, support, resistance, df
+            trend, sweep_type, sweep_quality, current_rsi, rsi_momentum, price_momentum,
+            support, resistance, df
         )
         entry, stop, target = self._calculate_levels(target_signal, df, support, resistance)
         
@@ -81,6 +86,8 @@ class TechnicalAnalyzer:
             "ema_200": float(df["ema_200"].iloc[-1]) if "ema_200" in df else 0.0,
             "rsi": float(current_rsi),
             "rsi_zone": rsi_zone,
+            "rsi_momentum": float(rsi_momentum),
+            "price_momentum": float(price_momentum),
             "macd": float(df["macd"].iloc[-1]),
             "macd_signal": float(df["macd_signal"].iloc[-1]),
             "macd_hist": float(df["macd_hist"].iloc[-1]),
@@ -162,8 +169,44 @@ class TechnicalAnalyzer:
         
         return sweep_type, quality
 
+    def _calculate_rsi_momentum(self, df: pd.DataFrame) -> float:
+        """Returns positive if RSI is turning up, negative if turning down"""
+        if len(df) < 5:
+            return 0.0
+        rsi_values = df["rsi"].tail(5).values
+        if len(rsi_values) < 3:
+            return 0.0
+        # Slope of last 3 RSI values
+        x = np.array([0, 1, 2])
+        y = rsi_values[-3:]
+        slope = np.polyfit(x, y, 1)[0]
+        return float(slope)
+
+    def _calculate_price_momentum(self, df: pd.DataFrame) -> float:
+        """Returns positive if price momentum is building for reversal"""
+        if len(df) < 5:
+            return 0.0
+        closes = df["close"].tail(5).values
+        if len(closes) < 3:
+            return 0.0
+        # Check if price is making higher lows (for BUY) or lower highs (for SELL)
+        lows = df["low"].tail(5).values
+        highs = df["high"].tail(5).values
+        
+        # Higher lows = positive momentum for BUY
+        hl = lows[-1] > lows[-2] > lows[-3] if len(lows) >= 3 else False
+        # Lower highs = negative momentum for SELL  
+        lh = highs[-1] < highs[-2] < highs[-3] if len(highs) >= 3 else False
+        
+        if hl:
+            return 1.0
+        elif lh:
+            return -1.0
+        return 0.0
+
     def _calculate_confluence(self, trend: str, sweep_type: Optional[str], sweep_quality: float,
-                             rsi: float, support: Optional[float], resistance: Optional[float],
+                             rsi: float, rsi_momentum: float, price_momentum: float,
+                             support: Optional[float], resistance: Optional[float],
                              df: pd.DataFrame) -> Tuple[float, str, str]:
         reasons = []
         score = 0.0
@@ -174,41 +217,61 @@ class TechnicalAnalyzer:
         
         if sweep_type == "BUY_SWEEP":
             if not is_macro_uptrend:
-                reasons.append(f"BUY blocked: Price {current_price:.2f} < 200 EMA {current_ema200:.2f}")
-                return 0.0, "HOLD", "\n".join(reasons)
+                reasons.append(f"Warning: Price {current_price:.2f} < 200 EMA {current_ema200:.2f}")
+                score *= 0.7
+            else:
+                reasons.append(f"Price above 200 EMA ✓")
             
             reasons.append(f"Liquidity Hunt at Support {support:.2f}")
             score += 0.4 * sweep_quality
             
-            if rsi <= self.rsi_buy_low:
-                reasons.append(f"RSI exhausted at {rsi:.1f}")
-                score += 0.3
+            # PREDICTIVE: RSI is oversold AND turning up (not just oversold)
+            if rsi <= self.rsi_buy_low and rsi_momentum > 0:
+                reasons.append(f"RSI turning up from {rsi:.1f} (momentum: +{rsi_momentum:.2f})")
+                score += 0.35
+            elif rsi <= self.rsi_buy_low:
+                reasons.append(f"RSI at {rsi:.1f} but not turning yet")
+                score += 0.15
+            
+            # PREDICTIVE: Price showing higher lows
+            if price_momentum > 0:
+                reasons.append("Price momentum building (higher lows)")
+                score += 0.2
+            
             if trend in ["BULLISH", "WEAK_BULLISH", "SIDEWAYS"]:
                 reasons.append(f"Trend {trend} aligns")
-                score += 0.2
-            if df["close"].iloc[-1] > df["open"].iloc[-1]:
                 score += 0.1
             
-            signal = "BUY" if score >= 0.45 else "HOLD"
+            signal = "BUY" if score >= 0.40 else "HOLD"
             
         elif sweep_type == "SELL_SWEEP":
             if is_macro_uptrend:
-                reasons.append(f"SELL blocked: Price {current_price:.2f} > 200 EMA {current_ema200:.2f}")
-                return 0.0, "HOLD", "\n".join(reasons)
+                reasons.append(f"Warning: Price {current_price:.2f} > 200 EMA {current_ema200:.2f}")
+                score *= 0.7
+            else:
+                reasons.append(f"Price below 200 EMA ✓")
             
             reasons.append(f"Liquidity Hunt at Resistance {resistance:.2f}")
             score += 0.4 * sweep_quality
             
-            if rsi >= self.rsi_sell_high:
-                reasons.append(f"RSI exhausted at {rsi:.1f}")
-                score += 0.3
+            # PREDICTIVE: RSI is overbought AND turning down
+            if rsi >= self.rsi_sell_high and rsi_momentum < 0:
+                reasons.append(f"RSI turning down from {rsi:.1f} (momentum: {rsi_momentum:.2f})")
+                score += 0.35
+            elif rsi >= self.rsi_sell_high:
+                reasons.append(f"RSI at {rsi:.1f} but not turning yet")
+                score += 0.15
+            
+            # PREDICTIVE: Price showing lower highs
+            if price_momentum < 0:
+                reasons.append("Price momentum building (lower highs)")
+                score += 0.2
+            
             if trend in ["BEARISH", "WEAK_BEARISH", "SIDEWAYS"]:
                 reasons.append(f"Trend {trend} aligns")
-                score += 0.2
-            if df["close"].iloc[-1] < df["open"].iloc[-1]:
                 score += 0.1
             
-            signal = "SELL" if score >= 0.45 else "HOLD"
+            signal = "SELL" if score >= 0.40 else "HOLD"
         else:
             reasons.append("Monitoring: Searching for liquidity setups")
         
@@ -260,9 +323,19 @@ class TechnicalAnalyzer:
         weights = {"rsi": 0.25, "macd": 0.25, "trend": 0.30, "bb": 0.20}
         
         rsi = indicators.get("rsi", 50.0)
-        if rsi < self.rsi_buy_low: score += weights["rsi"] * 1.0
-        elif rsi > self.rsi_sell_high: score += weights["rsi"] * -1.0
-        else: score += weights["rsi"] * ((self.rsi_midpoint - rsi) / self.rsi_range_half) * 0.5
+        rsi_momentum = indicators.get("rsi_momentum", 0.0)
+        
+        # PREDICTIVE: Score based on RSI level + momentum direction
+        if rsi < self.rsi_buy_low and rsi_momentum > 0:
+            score += weights["rsi"] * 1.0  # Strong BUY: oversold + turning up
+        elif rsi < self.rsi_buy_low:
+            score += weights["rsi"] * 0.5   # Weak BUY: oversold but not turning
+        elif rsi > self.rsi_sell_high and rsi_momentum < 0:
+            score += weights["rsi"] * -1.0  # Strong SELL: overbought + turning down
+        elif rsi > self.rsi_sell_high:
+            score += weights["rsi"] * -0.5  # Weak SELL: overbought but not turning
+        else:
+            score += weights["rsi"] * ((self.rsi_midpoint - rsi) / self.rsi_range_half) * 0.3
         
         current_price = indicators.get("current_price", 1.0)
         macd_diff = indicators.get("macd", 0) - indicators.get("macd_signal", 0)

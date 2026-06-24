@@ -28,10 +28,8 @@ class DataFeedManager:
         
         try:
             if pair == "BTCUSD":
-                # Use Deriv for BTCUSD
                 df = await self._fetch_from_deriv(pair, timeframe)
             elif pair == "ETHUSD":
-                # Use Kraken for ETHUSD
                 df = await self._fetch_from_kraken("XETHZUSD", timeframe)
             else:
                 logger.error(f"Unknown pair: {pair}")
@@ -65,7 +63,6 @@ class DataFeedManager:
             return None
 
     async def _fetch_from_kraken(self, pair: str, timeframe: str = "5m", limit: int = 720) -> Optional[pd.DataFrame]:
-        """Fetch from Kraken public API"""
         interval_map = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
         interval = interval_map.get(timeframe, 5)
         
@@ -117,15 +114,11 @@ class DataFeedManager:
             return None
 
     async def _fetch_from_deriv(self, pair: str, timeframe: str = "5m", limit: int = 1000) -> Optional[pd.DataFrame]:
-        """Fetch from Deriv API using their WebSocket/REST endpoint"""
         logger.info(f"Fetching {pair} from Deriv")
         
-        # Map timeframe to seconds
         granularity_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
         granularity = granularity_map.get(timeframe, 300)
         
-        # Use Deriv's API endpoint
-        # Try the newer API endpoint first
         api_url = "https://api.deriv.com/api/ticks_history"
         
         params = {
@@ -150,7 +143,6 @@ class DataFeedManager:
                         logger.error(f"Deriv HTTP {response.status}")
                         return await self._deriv_fallback_to_kraken(pair, timeframe, limit)
                     
-                    # Check if response is JSON
                     content_type = response.headers.get('content-type', '')
                     if 'application/json' not in content_type:
                         text = await response.text()
@@ -174,7 +166,6 @@ class DataFeedManager:
                     
                     df = pd.DataFrame(candles)
                     
-                    # Rename columns
                     column_map = {
                         'epoch': 'timestamp',
                         'open': 'open',
@@ -201,7 +192,6 @@ class DataFeedManager:
             return await self._deriv_fallback_to_kraken(pair, timeframe, limit)
 
     async def _deriv_fallback_to_kraken(self, pair: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
-        """Fallback to Kraken when Deriv fails"""
         logger.warning(f"Deriv failed for {pair}, falling back to Kraken")
         kraken_pair = "XXBTZUSD" if pair == "BTCUSD" else "XETHZUSD"
         return await self._fetch_from_kraken(kraken_pair, timeframe, limit)

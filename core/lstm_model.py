@@ -1,5 +1,5 @@
 # core/lstm_model.py
-# LSTM Model for Crypto Price Prediction
+# LSTM Model for Crypto Price Prediction - FIXED
 
 import os
 import numpy as np
@@ -30,22 +30,24 @@ class LSTMPredictor:
         self.model_path = os.path.join("models", "lstm")
         os.makedirs(self.model_path, exist_ok=True)
 
-    def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        features = pd.DataFrame()
+    def _prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Prepare features in exact same order for train AND predict"""
+        features = pd.DataFrame(index=df.index)
         features['close'] = df['close']
         features['high'] = df['high']
         features['low'] = df['low']
         features['volume'] = df.get('volume', 0)
-        features['rsi'] = df.get('rsi', 50)
-        features['macd'] = df.get('macd', 0)
-        features['macd_signal'] = df.get('macd_signal', 0)
+        features['rsi'] = df.get('rsi', 50.0)
+        features['macd'] = df.get('macd', 0.0)
+        features['macd_signal'] = df.get('macd_signal', 0.0)
         features['sma_20'] = df.get('sma_20', df['close'])
         features['sma_50'] = df.get('sma_50', df['close'])
         features['atr'] = df.get('atr', df['close'] * 0.01)
         features['bb_position'] = df.get('bb_position', 0.5)
         
-        features = features.fillna(method='ffill').fillna(0)
-        return features.values
+        # Forward fill then backward fill, then fill remaining with 0
+        features = features.ffill().bfill().fillna(0)
+        return features
 
     def _create_sequences(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         X, y = [], []
@@ -84,7 +86,13 @@ class LSTMPredictor:
         if not TF_AVAILABLE:
             return {"status": "error", "message": "TensorFlow not available"}
         
-        data = self._prepare_features(df)
+        features_df = self._prepare_features(df)
+        data = features_df.values
+        
+        if data.shape[1] != self.n_features:
+            logger.error(f"Feature mismatch: got {data.shape[1]} features, expected {self.n_features}")
+            return {"status": "error", "message": f"Feature mismatch: {data.shape[1]} vs {self.n_features}"}
+        
         scaled_data = self.scaler.fit_transform(data)
         
         X, y = self._create_sequences(scaled_data)
@@ -150,43 +158,57 @@ class LSTMPredictor:
         if not TF_AVAILABLE or self.model is None:
             return {"signal": "HOLD", "confidence": 0.0, "predicted_price": 0.0}
         
-        data = self._prepare_features(df)
-        scaled_data = self.scaler.transform(data)
-        
-        if len(scaled_data) < self.sequence_length:
+        try:
+            features_df = self._prepare_features(df)
+            data = features_df.values
+            
+            if data.shape[1] != self.n_features:
+                logger.error(f"Feature mismatch in predict: got {data.shape[1]} features, expected {self.n_features}")
+                return {"signal": "HOLD", "confidence": 0.0, "predicted_price": 0.0}
+            
+            # Check we have enough data
+            if len(data) < self.sequence_length:
+                logger.warning(f"Not enough data for prediction: {len(data)} < {self.sequence_length}")
+                return {"signal": "HOLD", "confidence": 0.0, "predicted_price": 0.0}
+            
+            scaled_data = self.scaler.transform(data)
+            
+            last_sequence = scaled_data[-self.sequence_length:]
+            last_sequence = np.reshape(last_sequence, (1, self.sequence_length, self.n_features))
+            
+            predicted_scaled = self.model.predict(last_sequence, verbose=0)[0][0]
+            
+            # Inverse transform the prediction
+            dummy = np.zeros((1, self.n_features))
+            dummy[0, 0] = predicted_scaled
+            predicted_price = self.scaler.inverse_transform(dummy)[0, 0]
+            
+            current_price = df['close'].iloc[-1]
+            price_change = (predicted_price - current_price) / current_price if current_price > 0 else 0
+            
+            threshold = float(os.getenv('LSTM_THRESHOLD_PERCENT', '0.05')) / 100
+            
+            if price_change > threshold:
+                signal = "BUY"
+                confidence = min(abs(price_change) / (threshold * 3), 0.99)
+            elif price_change < -threshold:
+                signal = "SELL"
+                confidence = min(abs(price_change) / (threshold * 3), 0.99)
+            else:
+                signal = "HOLD"
+                confidence = 0.0
+            
+            return {
+                "signal": signal,
+                "confidence": float(confidence),
+                "predicted_price": float(predicted_price),
+                "current_price": float(current_price),
+                "price_change_pct": float(price_change * 100)
+            }
+            
+        except Exception as e:
+            logger.error(f"LSTM prediction error: {e}")
             return {"signal": "HOLD", "confidence": 0.0, "predicted_price": 0.0}
-        
-        last_sequence = scaled_data[-self.sequence_length:]
-        last_sequence = np.reshape(last_sequence, (1, self.sequence_length, self.n_features))
-        
-        predicted_scaled = self.model.predict(last_sequence, verbose=0)[0][0]
-        
-        dummy = np.zeros((1, self.n_features))
-        dummy[0, 0] = predicted_scaled
-        predicted_price = self.scaler.inverse_transform(dummy)[0, 0]
-        
-        current_price = df['close'].iloc[-1]
-        price_change = (predicted_price - current_price) / current_price
-        
-        threshold = float(os.getenv('LSTM_THRESHOLD_PERCENT', '0.05')) / 100
-        
-        if price_change > threshold:
-            signal = "BUY"
-            confidence = min(abs(price_change) / (threshold * 3), 0.99)
-        elif price_change < -threshold:
-            signal = "SELL"
-            confidence = min(abs(price_change) / (threshold * 3), 0.99)
-        else:
-            signal = "HOLD"
-            confidence = 0.0
-        
-        return {
-            "signal": signal,
-            "confidence": float(confidence),
-            "predicted_price": float(predicted_price),
-            "current_price": float(current_price),
-            "price_change_pct": float(price_change * 100)
-        }
 
 class EnsemblePredictor:
     def __init__(self):

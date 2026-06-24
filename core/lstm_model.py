@@ -45,7 +45,7 @@ class LSTMPredictor:
         features['atr'] = df.get('atr', df['close'] * 0.01)
         features['bb_position'] = df.get('bb_position', 0.5)
         
-        # Forward fill then backward fill, then fill remaining with 0
+        # Use ffill/bfill instead of deprecated fillna(method='ffill')
         features = features.ffill().bfill().fillna(0)
         return features
 
@@ -166,7 +166,6 @@ class LSTMPredictor:
                 logger.error(f"Feature mismatch in predict: got {data.shape[1]} features, expected {self.n_features}")
                 return {"signal": "HOLD", "confidence": 0.0, "predicted_price": 0.0}
             
-            # Check we have enough data
             if len(data) < self.sequence_length:
                 logger.warning(f"Not enough data for prediction: {len(data)} < {self.sequence_length}")
                 return {"signal": "HOLD", "confidence": 0.0, "predicted_price": 0.0}
@@ -178,7 +177,6 @@ class LSTMPredictor:
             
             predicted_scaled = self.model.predict(last_sequence, verbose=0)[0][0]
             
-            # Inverse transform the prediction
             dummy = np.zeros((1, self.n_features))
             dummy[0, 0] = predicted_scaled
             predicted_price = self.scaler.inverse_transform(dummy)[0, 0]

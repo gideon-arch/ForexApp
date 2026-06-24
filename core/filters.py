@@ -19,6 +19,8 @@ class FilterManager:
         self.daily_counts: Dict[str, int] = {}
         self.last_reset = datetime.now().date()
         self.analyzer = TechnicalAnalyzer()
+        self.rsi_buy_tiers = [40.0, 35.0]
+        self.rsi_sell_tiers = [60.0, 65.0]
         logger.info(f"FilterManager | Cooldown: {self.min_interval.total_seconds()/60:.0f}m | S/R Tolerance: {self.sr_tolerance*100:.2f}%")
 
     def validate_signal(self, df: pd.DataFrame, signal_type: str, current_price: float, pair: str = "") -> Tuple[bool, Dict]:
@@ -58,7 +60,6 @@ class FilterManager:
         total_filters = 0
         
         if signal_type == "BUY":
-            # FILTER 1: Structure must allow bounce (not strong bearish)
             structure_ok = market_structure not in ["BEARISH"]
             filters_report["market_structure"] = {
                 "passed": structure_ok,
@@ -67,25 +68,23 @@ class FilterManager:
             if structure_ok: passed_filters += 1
             total_filters += 1
             
-            # FILTER 2: Price at key level OR liquidity sweep
             near_support = False
+            in_oversold_zone = bb_pos < 0.2
             if support:
-                low_bound = support * (1 - self.sr_tolerance)
-                high_bound = support * (1 + self.sr_tolerance)
+                low_bound = support * (1 - self.sr_tolerance * 2)
+                high_bound = support * (1 + self.sr_tolerance * 2)
                 near_support = low_bound <= current_price <= high_bound
             
-            sweep_or_level = (sweep == "BUY_SWEEP") or near_support
+            sweep_or_level = (sweep == "BUY_SWEEP") or near_support or in_oversold_zone
             filters_report["smc_level"] = {
                 "passed": sweep_or_level,
-                "reason": f"Sweep: {sweep} | Near Support: {near_support}"
+                "reason": f"Sweep: {sweep} | Near S: {near_support} | BB Low: {in_oversold_zone}"
             }
             if sweep_or_level: passed_filters += 1
             total_filters += 1
             
-            # FILTER 3: PREDICTIVE — RSI oversold AND turning up (not just oversold)
-            # This is the KEY difference — we want RSI 35-45 that's RISING, not 20 that's still falling
+            # PREDICTIVE: RSI in sweet spot 35-45 OR oversold and turning up
             rsi_predictive = (rsi <= 45) and (rsi_momentum > 0)
-            # OR: RSI is in sweet spot 35-45 (about to bounce, not already crashed to 20)
             rsi_sweet_spot = 35 <= rsi <= 45
             
             rsi_ok = rsi_predictive or rsi_sweet_spot
@@ -96,8 +95,8 @@ class FilterManager:
             if rsi_ok: passed_filters += 1
             total_filters += 1
             
-            # FILTER 4: PREDICTIVE — Price momentum building (higher lows)
-            momentum_ok = price_momentum >= 0  # Allow neutral or positive
+            # PREDICTIVE: Price momentum building (higher lows)
+            momentum_ok = price_momentum >= 0
             filters_report["price_momentum"] = {
                 "passed": momentum_ok,
                 "reason": f"Price momentum: {price_momentum:+.1f}"
@@ -115,20 +114,21 @@ class FilterManager:
             total_filters += 1
             
             near_resistance = False
+            in_overbought_zone = bb_pos > 0.8
             if resistance:
-                low_bound = resistance * (1 - self.sr_tolerance)
-                high_bound = resistance * (1 + self.sr_tolerance)
+                low_bound = resistance * (1 - self.sr_tolerance * 2)
+                high_bound = resistance * (1 + self.sr_tolerance * 2)
                 near_resistance = low_bound <= current_price <= high_bound
             
-            sweep_or_level = (sweep == "SELL_SWEEP") or near_resistance
+            sweep_or_level = (sweep == "SELL_SWEEP") or near_resistance or in_overbought_zone
             filters_report["smc_level"] = {
                 "passed": sweep_or_level,
-                "reason": f"Sweep: {sweep} | Near Resistance: {near_resistance}"
+                "reason": f"Sweep: {sweep} | Near R: {near_resistance} | BB High: {in_overbought_zone}"
             }
             if sweep_or_level: passed_filters += 1
             total_filters += 1
             
-            # PREDICTIVE: RSI overbought AND turning down, OR in sweet spot 55-65
+            # PREDICTIVE: RSI in sweet spot 55-65 OR overbought and turning down
             rsi_predictive = (rsi >= 55) and (rsi_momentum < 0)
             rsi_sweet_spot = 55 <= rsi <= 65
             
@@ -140,7 +140,7 @@ class FilterManager:
             if rsi_ok: passed_filters += 1
             total_filters += 1
             
-            # PREDICTIVE — Price momentum building (lower highs)
+            # PREDICTIVE: Price momentum building (lower highs)
             momentum_ok = price_momentum <= 0
             filters_report["price_momentum"] = {
                 "passed": momentum_ok,
@@ -154,7 +154,7 @@ class FilterManager:
             return False, {"filters": filters_report, "price": current_price}
         
         # ALL 4 filters must pass for predictive accuracy
-        # But if 3 of 4 pass with high confidence, allow it
+        # But if 3 of 4 pass with strong trend (ADX > 25), allow it
         overall_passed = (passed_filters >= 4) or (passed_filters == 3 and adx > 25)
         
         if overall_passed:

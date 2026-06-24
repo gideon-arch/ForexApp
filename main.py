@@ -1,5 +1,5 @@
 # main.py - AI Crypto Signal Bot (Production Ready)
-# PREDICTIVE VERSION — Signals BEFORE the move, not after
+# FINAL VERSION — With keep-alive ping + TA fallback
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -10,6 +10,7 @@ import asyncio
 import redis.asyncio as redis
 import json
 import logging
+import aiohttp
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,6 +110,7 @@ class CloudForexEngine:
         self.filter_managers = {}
         self.predictors = {}
         self.analyzer = TechnicalAnalyzer()
+        self.lstm_available = True
         logger.info("CloudForexEngine initialized | Deriv for BTCUSD, Kraken for ETHUSD")
 
     async def initialize(self):
@@ -118,13 +120,19 @@ class CloudForexEngine:
             self.notification_manager = NotificationManager()
             for pair in self.pairs_config:
                 self.filter_managers[pair] = FilterManager()
-                self.predictors[pair] = EnsemblePredictor()
-                model_loaded = self.predictors[pair].lstm.load_model(pair)
-                if not model_loaded:
-                    logger.warning(f"No model found for {pair}. Will train on live data...")
-                    await self._auto_train_model(pair)
-                else:
-                    logger.info(f"Model loaded for {pair}")
+                
+                try:
+                    self.predictors[pair] = EnsemblePredictor()
+                    model_loaded = self.predictors[pair].lstm.load_model(pair)
+                    if not model_loaded:
+                        logger.warning(f"No model found for {pair}. LSTM will use TA fallback.")
+                    else:
+                        logger.info(f"Model loaded for {pair}")
+                except Exception as e:
+                    logger.warning(f"LSTM init failed for {pair}: {e}. Using TA-only mode.")
+                    self.lstm_available = False
+                    self.predictors[pair] = None
+                
                 self.health[pair] = {
                     'status': 'initializing',
                     'last_check': None,
@@ -151,6 +159,19 @@ class CloudForexEngine:
         except Exception as e:
             logger.error(f"Auto-training failed for {pair}: {e}")
             return False
+
+    async def _keep_alive_ping(self):
+        """Ping our own health endpoint to keep Render free tier alive"""
+        await asyncio.sleep(60)  # Wait for server to start
+        while app_state['is_running']:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get('http://localhost:8000/health', timeout=10) as resp:
+                        logger.debug(f"Keep-alive ping: {resp.status}")
+                await asyncio.sleep(300)  # Every 5 minutes
+            except Exception as e:
+                logger.debug(f"Keep-alive ping failed: {e}")
+                await asyncio.sleep(60)
 
     async def monitor_pair(self, pair: str):
         config = self.pairs_config[pair]
@@ -180,62 +201,80 @@ class CloudForexEngine:
                 
                 current_price = indicators['current_price']
                 tech_score = self.analyzer.generate_technical_score(indicators)
+                smc_signal = indicators.get('smc_suggested_signal', 'HOLD')
+                smc_score = indicators.get('confluence_score', 0.0)
                 
-                try:
-                    prediction = self.predictors[pair].predict(
-                        df, tech_score=tech_score, fund_score=0.0, pair=pair
-                    )
-                except Exception as e:
-                    logger.warning(f"LSTM prediction failed for {pair}: {e}")
-                    prediction = {"signal": "HOLD", "confidence": 0.0}
+                lstm_signal = "HOLD"
+                lstm_confidence = 0.0
+                prediction_source = "TA_ONLY"
                 
-                lstm_signal = prediction['signal']
-                lstm_confidence = prediction['confidence']
+                if self.lstm_available and self.predictors[pair] is not None:
+                    try:
+                        prediction = self.predictors[pair].predict(
+                            df, tech_score=tech_score, fund_score=0.0, pair=pair
+                        )
+                        lstm_signal = prediction['signal']
+                        lstm_confidence = prediction['confidence']
+                        prediction_source = "LSTM"
+                    except Exception as e:
+                        logger.warning(f"LSTM prediction failed for {pair}: {e}. Using TA fallback.")
+                
+                final_signal = "HOLD"
+                final_confidence = 0.0
                 
                 if lstm_signal in ['BUY', 'SELL'] and lstm_confidence >= 0.4:
+                    final_signal = lstm_signal
+                    final_confidence = lstm_confidence
+                elif smc_signal in ['BUY', 'SELL'] and smc_score >= 0.40:
+                    final_signal = smc_signal
+                    final_confidence = min(smc_score + 0.2, 0.85)
+                    prediction_source = "SMC_FALLBACK"
+                
+                if final_signal in ['BUY', 'SELL']:
                     filter_passed, filter_report = self.filter_managers[pair].validate_signal(
-                        df, lstm_signal, current_price, pair=pair
+                        df, final_signal, current_price, pair=pair
                     )
                     if filter_passed:
-                        candle_ok = check_candlestick_reversal(df, lstm_signal, pair)
+                        candle_ok = check_candlestick_reversal(df, final_signal, pair)
                         if candle_ok:
                             alert = SignalAlert(
                                 pair=pair,
-                                signal=lstm_signal,
+                                signal=final_signal,
                                 price=current_price,
-                                confidence=lstm_confidence,
+                                confidence=final_confidence,
                                 timestamp=datetime.utcnow(),
-                                reasoning=indicators.get('smc_reasoning', 'AI Pattern Recognition'),
+                                reasoning=indicators.get('smc_reasoning', f'{prediction_source} Pattern Recognition'),
                                 target=indicators.get('suggested_take_profit'),
                                 stop_loss=indicators.get('suggested_stop_loss'),
-                                urgency='high' if lstm_confidence > 0.85 else 'normal'
+                                urgency='high' if final_confidence > 0.85 else 'normal'
                             )
                             await self.notification_manager.send_telegram_alert(alert)
                             
                             signal_data = {
                                 'pair': pair,
-                                'signal': lstm_signal,
+                                'signal': final_signal,
                                 'price': current_price,
-                                'confidence': lstm_confidence,
+                                'confidence': final_confidence,
                                 'timestamp': datetime.utcnow().isoformat(),
                                 'target': indicators.get('suggested_take_profit'),
                                 'stop_loss': indicators.get('suggested_stop_loss'),
-                                'reasoning': indicators.get('smc_reasoning', '')
+                                'reasoning': indicators.get('smc_reasoning', ''),
+                                'source': prediction_source
                             }
                             if redis_client:
                                 await redis_client.setex(f"signal:{pair}:current", 3600, json.dumps(signal_data))
                             
-                            self.last_sent_signal[pair] = lstm_signal
+                            self.last_sent_signal[pair] = final_signal
                             self.health[pair]['signals_today'] += 1
                             self.health[pair]['last_signal'] = signal_data
-                            logger.info(f"SIGNAL SENT: {pair} {lstm_signal} @ {current_price:.2f} (conf: {lstm_confidence:.2%})")
+                            logger.info(f"SIGNAL SENT: {pair} {final_signal} @ {current_price:.2f} (conf: {final_confidence:.2%}) [Source: {prediction_source}]")
                         else:
-                            logger.info(f"FILTER DEBUG: {pair} {lstm_signal} rejected by Candle Reversal Check.")
+                            logger.info(f"FILTER DEBUG: {pair} {final_signal} rejected by Candle Reversal Check.")
                     else:
                         reason = filter_report.get('filters', {}).get('cooldown_check', {}).get('reason', 'Filter blocked')
-                        logger.info(f"FILTER DEBUG: {pair} {lstm_signal} rejected. Reason: {reason}")
+                        logger.info(f"FILTER DEBUG: {pair} {final_signal} rejected. Reason: {reason}")
                 else:
-                    logger.info(f"FILTER DEBUG: {pair} signal {lstm_signal} rejected. Confidence too low: {lstm_confidence:.2f}")
+                    logger.info(f"FILTER DEBUG: {pair} no valid signal. LSTM: {lstm_signal}({lstm_confidence:.2f}) | SMC: {smc_signal}({smc_score:.2f})")
                 
                 self.health[pair]['status'] = 'healthy'
                 self.health[pair]['last_check'] = asyncio.get_event_loop().time()
@@ -252,6 +291,8 @@ class CloudForexEngine:
 
     async def start(self):
         await self.initialize()
+        # Start keep-alive pinger
+        asyncio.create_task(self._keep_alive_ping())
         for pair in self.pairs_config:
             self.tasks[pair] = asyncio.create_task(self.monitor_pair(pair))
             await asyncio.sleep(2)
@@ -275,7 +316,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="BTCUSD & ETHUSD pattern prediction with Telegram alerts",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -291,7 +332,7 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "pairs": list(app_state.get('engine', {}).pairs_config.keys() if app_state.get('engine') else []),
-        "version": "2.0.0"
+        "version": "2.1.0"
     }
 
 @app.get("/health")

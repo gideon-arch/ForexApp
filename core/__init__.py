@@ -4,7 +4,7 @@
 from .data_feed import DataFeedManager
 from .technical_analysis import TechnicalAnalyzer
 from .filters import FilterManager
-from .lstm_model import EnsemblePredictor, UniversalLSTMPredictor
+from .lstm_model import EnsemblePredictor, LSTMPredictor
 from .notifications import NotificationManager, SignalAlert
 
 __all__ = [
@@ -12,7 +12,7 @@ __all__ = [
     'TechnicalAnalyzer',
     'FilterManager',
     'EnsemblePredictor',
-    'UniversalLSTMPredictor',
+    'LSTMPredictor',
     'NotificationManager',
     'SignalAlert'
 ]

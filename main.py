@@ -1,5 +1,5 @@
 # main.py - AI Crypto Signal Bot (Production Ready)
-# FINAL VERSION — With keep-alive ping + TA fallback
+# FINAL VERSION — With keep-alive ping + startup Telegram message
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -118,6 +118,21 @@ class CloudForexEngine:
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
+            
+            # Send startup test message to Telegram
+            try:
+                await self.notification_manager.send_test_message(
+                    "🤖 AI Crypto Bot is ONLINE!\n"
+                    "━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ Monitoring: BTCUSD & ETHUSD\n"
+                    "⏱️ Timeframe: 5m\n"
+                    "🎯 Signals: Predictive (before the move)\n"
+                    "⚙️ Version: 2.1.0"
+                )
+                logger.info("Startup test message sent to Telegram")
+            except Exception as e:
+                logger.warning(f"Failed to send startup message: {e}")
+            
             for pair in self.pairs_config:
                 self.filter_managers[pair] = FilterManager()
                 
@@ -162,13 +177,13 @@ class CloudForexEngine:
 
     async def _keep_alive_ping(self):
         """Ping our own health endpoint to keep Render free tier alive"""
-        await asyncio.sleep(60)  # Wait for server to start
+        await asyncio.sleep(60)
         while app_state['is_running']:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get('http://localhost:8000/health', timeout=10) as resp:
                         logger.debug(f"Keep-alive ping: {resp.status}")
-                await asyncio.sleep(300)  # Every 5 minutes
+                await asyncio.sleep(300)
             except Exception as e:
                 logger.debug(f"Keep-alive ping failed: {e}")
                 await asyncio.sleep(60)
@@ -291,7 +306,6 @@ class CloudForexEngine:
 
     async def start(self):
         await self.initialize()
-        # Start keep-alive pinger
         asyncio.create_task(self._keep_alive_ping())
         for pair in self.pairs_config:
             self.tasks[pair] = asyncio.create_task(self.monitor_pair(pair))

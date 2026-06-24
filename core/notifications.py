@@ -85,7 +85,7 @@ class NotificationManager:
             f"🛑 <b>Stop Loss:</b> <code>{clean_sl}</code>\n"
             f"⏰ <b>Time:</b> <code>{clean_time}</code>\n\n"
             f"💡 <b>Analysis:</b>\n<i>{clean_reason}</i>\n\n"
-            f"⚙️ <code>AI Crypto Bot v2.0</code>"
+            f"⚙️ <code>AI Crypto Bot v2.1</code>"
         )
         
         try:

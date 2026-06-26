@@ -1,5 +1,5 @@
 # main.py - AI Crypto Signal Bot (Production Ready)
-# FINAL VERSION — With keep-alive ping + startup Telegram message
+# MODERATE SPEED VERSION — 3m candles, 30s checks, balanced quality
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -97,9 +97,10 @@ def check_candlestick_reversal(df_candles, signal_type: str, pair: str) -> bool:
 
 class CloudForexEngine:
     def __init__(self):
+        # MODERATE: 3m timeframe, 30s check interval
         self.pairs_config = {
-            "BTCUSD": {"source": "deriv", "tf": "5m", "check_interval": 60},
-            "ETHUSD": {"source": "kraken", "tf": "5m", "check_interval": 60}
+            "BTCUSD": {"source": "deriv", "tf": "3m", "check_interval": 30},
+            "ETHUSD": {"source": "kraken", "tf": "3m", "check_interval": 30}
         }
         self.tasks = {}
         self.health = {}
@@ -111,7 +112,7 @@ class CloudForexEngine:
         self.predictors = {}
         self.analyzer = TechnicalAnalyzer()
         self.lstm_available = True
-        logger.info("CloudForexEngine initialized | Deriv for BTCUSD, Kraken for ETHUSD")
+        logger.info("CloudForexEngine initialized | MODERATE: 3m candles, 30s checks")
 
     async def initialize(self):
         logger.info("Initializing Engine...")
@@ -125,9 +126,9 @@ class CloudForexEngine:
                     "🤖 AI Crypto Bot is ONLINE!\n"
                     "━━━━━━━━━━━━━━━━━━━\n"
                     "✅ Monitoring: BTCUSD & ETHUSD\n"
-                    "⏱️ Timeframe: 5m\n"
+                    "⚡ MODERATE MODE: 3m candles / 30s checks\n"
                     "🎯 Signals: Predictive (before the move)\n"
-                    "⚙️ Version: 2.1.0"
+                    "⚙️ Version: 2.2.1 MODERATE"
                 )
                 logger.info("Startup test message sent to Telegram")
             except Exception as e:
@@ -176,7 +177,6 @@ class CloudForexEngine:
             return False
 
     async def _keep_alive_ping(self):
-        """Ping our own health endpoint to keep Render free tier alive"""
         await asyncio.sleep(60)
         while app_state['is_running']:
             try:
@@ -190,7 +190,7 @@ class CloudForexEngine:
 
     async def monitor_pair(self, pair: str):
         config = self.pairs_config[pair]
-        logger.info(f"Starting monitor for {pair} ({config['source']})")
+        logger.info(f"Starting MODERATE monitor for {pair} ({config['source']}) | {config['tf']} candles every {config['check_interval']}s")
         while app_state['is_running']:
             try:
                 start_time = asyncio.get_event_loop().time()
@@ -200,11 +200,11 @@ class CloudForexEngine:
                 )
                 if df is None or df.empty:
                     logger.warning(f"No data for {pair}")
-                    await asyncio.sleep(15)
+                    await asyncio.sleep(10)
                     continue
                 if len(df) < 200:
                     logger.warning(f"Insufficient data for {pair}: {len(df)} candles")
-                    await asyncio.sleep(15)
+                    await asyncio.sleep(10)
                     continue
                 
                 try:
@@ -218,6 +218,15 @@ class CloudForexEngine:
                 tech_score = self.analyzer.generate_technical_score(indicators)
                 smc_signal = indicators.get('smc_suggested_signal', 'HOLD')
                 smc_score = indicators.get('confluence_score', 0.0)
+                rsi = indicators.get('rsi', 50.0)
+                rsi_momentum = indicators.get('rsi_momentum', 0.0)
+                
+                # EARLY WARNING: Setup forming but not confirmed yet
+                if smc_score >= 0.20 and smc_score < 0.35:
+                    if rsi <= 42 and rsi_momentum > 0 and smc_signal == 'BUY':
+                        logger.info(f"⚠️ EARLY WARNING: {pair} BUY setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f})")
+                    elif rsi >= 58 and rsi_momentum < 0 and smc_signal == 'SELL':
+                        logger.info(f"⚠️ EARLY WARNING: {pair} SELL setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f})")
                 
                 lstm_signal = "HOLD"
                 lstm_confidence = 0.0
@@ -240,7 +249,7 @@ class CloudForexEngine:
                 if lstm_signal in ['BUY', 'SELL'] and lstm_confidence >= 0.4:
                     final_signal = lstm_signal
                     final_confidence = lstm_confidence
-                elif smc_signal in ['BUY', 'SELL'] and smc_score >= 0.40:
+                elif smc_signal in ['BUY', 'SELL'] and smc_score >= 0.35:
                     final_signal = smc_signal
                     final_confidence = min(smc_score + 0.2, 0.85)
                     prediction_source = "SMC_FALLBACK"
@@ -282,7 +291,7 @@ class CloudForexEngine:
                             self.last_sent_signal[pair] = final_signal
                             self.health[pair]['signals_today'] += 1
                             self.health[pair]['last_signal'] = signal_data
-                            logger.info(f"SIGNAL SENT: {pair} {final_signal} @ {current_price:.2f} (conf: {final_confidence:.2%}) [Source: {prediction_source}]")
+                            logger.info(f"🚀 SIGNAL SENT: {pair} {final_signal} @ {current_price:.2f} (conf: {final_confidence:.2%}) [Source: {prediction_source}]")
                         else:
                             logger.info(f"FILTER DEBUG: {pair} {final_signal} rejected by Candle Reversal Check.")
                     else:
@@ -298,11 +307,11 @@ class CloudForexEngine:
                 await asyncio.sleep(sleep_time)
                 
             except asyncio.TimeoutError:
-                logger.error(f"Timeout fetching {pair}. Retrying in 20s...")
-                await asyncio.sleep(20)
+                logger.error(f"Timeout fetching {pair}. Retrying in 15s...")
+                await asyncio.sleep(15)
             except Exception as e:
                 logger.error(f"Error in {pair} loop: {e}")
-                await asyncio.sleep(15)
+                await asyncio.sleep(10)
 
     async def start(self):
         await self.initialize()
@@ -330,7 +339,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="BTCUSD & ETHUSD pattern prediction with Telegram alerts",
-    version="2.1.0",
+    version="2.2.1",
     lifespan=lifespan
 )
 
@@ -346,7 +355,7 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "pairs": list(app_state.get('engine', {}).pairs_config.keys() if app_state.get('engine') else []),
-        "version": "2.1.0"
+        "version": "2.2.1"
     }
 
 @app.get("/health")

@@ -1,5 +1,5 @@
 # core/filters.py
-# PREDICTIVE Validation — Signals BEFORE the move, not after
+# MODERATE VERSION — 3 of 4 filters, 30min cooldown, balanced
 
 import os
 from datetime import datetime, timedelta
@@ -14,14 +14,12 @@ logger = logging.getLogger(__name__)
 class FilterManager:
     def __init__(self):
         self.sr_tolerance = float(os.getenv("SR_ZONE_TOLERANCE", "0.003"))
-        self.min_interval = timedelta(minutes=int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "45")))
+        self.min_interval = timedelta(minutes=int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "30")))
         self.last_signals: Dict[str, datetime] = {}
         self.daily_counts: Dict[str, int] = {}
         self.last_reset = datetime.now().date()
         self.analyzer = TechnicalAnalyzer()
-        self.rsi_buy_tiers = [40.0, 35.0]
-        self.rsi_sell_tiers = [60.0, 65.0]
-        logger.info(f"FilterManager | Cooldown: {self.min_interval.total_seconds()/60:.0f}m | S/R Tolerance: {self.sr_tolerance*100:.2f}%")
+        logger.info(f"FilterManager | Cooldown: {self.min_interval.total_seconds()/60:.0f}m | MODERATE: 3/4 filters")
 
     def validate_signal(self, df: pd.DataFrame, signal_type: str, current_price: float, pair: str = "") -> Tuple[bool, Dict]:
         now = datetime.now()
@@ -83,7 +81,6 @@ class FilterManager:
             if sweep_or_level: passed_filters += 1
             total_filters += 1
             
-            # PREDICTIVE: RSI in sweet spot 35-45 OR oversold and turning up
             rsi_predictive = (rsi <= 45) and (rsi_momentum > 0)
             rsi_sweet_spot = 35 <= rsi <= 45
             
@@ -95,7 +92,6 @@ class FilterManager:
             if rsi_ok: passed_filters += 1
             total_filters += 1
             
-            # PREDICTIVE: Price momentum building (higher lows)
             momentum_ok = price_momentum >= 0
             filters_report["price_momentum"] = {
                 "passed": momentum_ok,
@@ -128,7 +124,6 @@ class FilterManager:
             if sweep_or_level: passed_filters += 1
             total_filters += 1
             
-            # PREDICTIVE: RSI in sweet spot 55-65 OR overbought and turning down
             rsi_predictive = (rsi >= 55) and (rsi_momentum < 0)
             rsi_sweet_spot = 55 <= rsi <= 65
             
@@ -140,7 +135,6 @@ class FilterManager:
             if rsi_ok: passed_filters += 1
             total_filters += 1
             
-            # PREDICTIVE: Price momentum building (lower highs)
             momentum_ok = price_momentum <= 0
             filters_report["price_momentum"] = {
                 "passed": momentum_ok,
@@ -153,9 +147,8 @@ class FilterManager:
             filters_report["hold"] = {"passed": False, "reason": "Signal is HOLD"}
             return False, {"filters": filters_report, "price": current_price}
         
-        # ALL 4 filters must pass for predictive accuracy
-        # But if 3 of 4 pass with strong trend (ADX > 25), allow it
-        overall_passed = (passed_filters >= 4) or (passed_filters == 3 and adx > 25)
+        # MODERATE: 3 of 4 filters pass
+        overall_passed = passed_filters >= 3
         
         if overall_passed:
             self.last_signals[cooldown_key] = now

@@ -275,4 +275,3 @@ class FakeoutDetector:
                 return False, f"WARNING: {trap} possible. Use tight stop."
 
         return False, "Fakeout risk low"
-

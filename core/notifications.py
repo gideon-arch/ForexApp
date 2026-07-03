@@ -131,10 +131,10 @@ class NotificationManager:
             f"🧠 Analysis:",
             f"{alert.reasoning}",
             f"━━━━━━━━━━━━━━━━━━━━━━━",
-            f"🤖 AI Crypto Bot v4.0 | No LSTM | Pure Price Action"
+            f"🤖 AI Crypto Bot v4.1 | Fibonacci + Trend Filter | Pure Price Action"
         ])
 
-        return "\n".join(lines)
+        return "\\n".join(lines)
 
     async def _send_telegram_message(self, message: str) -> bool:
         if not self.bot_token or not self.chat_id:
@@ -166,3 +166,4 @@ class NotificationManager:
         if self.session and not self.session.closed:
             await self.session.close()
             logger.info("NotificationManager session closed")
+

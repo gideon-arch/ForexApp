@@ -1,11 +1,10 @@
 # core/technical_analysis.py
 # PREDICTIVE SMC Strategy — Signals BEFORE the move, not after
-# VERSION 4.0 — CONFLUENCE SCORING (No LSTM)
-# Candlestick patterns + Live candle + RSI divergence + Fakeout protection
-# All signals ADD UP instead of hard priority exits
+# VERSION 4.1 — FIBONACCI CONFLUENCE + FIXED TREND FILTER + 5M CANDLES
+# Candlestick patterns + Live candle + RSI divergence + Fakeout + SMC + Fibonacci
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import numpy as np
 import pandas as pd
 import ta
@@ -26,8 +25,8 @@ class TechnicalAnalyzer:
         self.pattern_recognizer = CandlestickPatternRecognizer()
         self.fakeout_detector = FakeoutDetector()
         logger.info(
-            f"TechnicalAnalyzer v4.0 | RSI: {self.rsi_buy_low}-{self.rsi_sell_high} | "
-            f"CONFLUENCE SCORING — Candlestick + Live + Divergence + Fakeout"
+            f"TechnicalAnalyzer v4.1 | RSI: {self.rsi_buy_low}-{self.rsi_sell_high} | "
+            f"FIBONACCI + CONFLUENCE SCORING — Candlestick + Live + Divergence + Fakeout + SMC + Fib"
         )
 
     def calculate_indicators(self, df: pd.DataFrame) -> Dict:
@@ -74,6 +73,9 @@ class TechnicalAnalyzer:
         support, resistance = self._mark_support_resistance(df, swing_highs, swing_lows)
         sweep_type, sweep_quality = self._detect_liquidity_sweep(df, support, resistance)
 
+        # FIBONACCI ZONES
+        fib_zones = self._calculate_fibonacci_zones(df, swing_highs, swing_lows)
+
         pattern_result = self.pattern_recognizer.analyze(df)
         live_reversal, live_score = self._detect_live_reversal(df)
         div_type, div_score = self._detect_rsi_divergence(df)
@@ -104,7 +106,8 @@ class TechnicalAnalyzer:
             div_type=div_type,
             div_score=div_score,
             pattern_result=pattern_result,
-            fakeout_result=fakeout_result
+            fakeout_result=fakeout_result,
+            fib_zones=fib_zones
         )
 
         entry, stop, target = self._calculate_levels(target_signal, df, support, resistance)
@@ -156,27 +159,56 @@ class TechnicalAnalyzer:
             "fakeout_trap_type": fakeout_result.get("trap_type"),
             "fakeout_reasoning": fakeout_result.get("reasoning", ""),
             "fakeout_confidence": fakeout_result.get("confidence", 0.0),
+            # FIBONACCI
+            "fib_zones": fib_zones,
+            "nearest_fib_zone": fib_zones.get("nearest_zone") if fib_zones else None,
+            "fib_position": fib_zones.get("position") if fib_zones else None,
             "dataframe": df,
         }
 
     def _find_market_structure(self, df: pd.DataFrame, window: int = 5) -> Tuple[str, list, list]:
+        """Market structure using 200 EMA as PRIMARY trend filter."""
         df["swing_high"] = df["high"] == df["high"].rolling(window=window*2+1, center=True).max()
         df["swing_low"] = df["low"] == df["low"].rolling(window=window*2+1, center=True).min()
 
         recent_highs = df[df["swing_high"]]["high"].tail(8).tolist()
         recent_lows = df[df["swing_low"]]["low"].tail(8).tolist()
 
-        trend = "SIDEWAYS"
+        current_price = df["close"].iloc[-1]
+        ema_200 = df["ema_200"].iloc[-1] if "ema_200" in df else current_price
+
+        # PRIMARY: 200 EMA trend
+        if current_price > ema_200 * 1.005:
+            primary_trend = "BULLISH"
+        elif current_price < ema_200 * 0.995:
+            primary_trend = "BEARISH"
+        else:
+            primary_trend = "SIDEWAYS"
+
+        # SECONDARY: Swing structure (only refines primary)
+        swing_trend = "SIDEWAYS"
         if len(recent_highs) >= 2 and len(recent_lows) >= 2:
             hh = recent_highs[-1] > recent_highs[-2]
             hl = recent_lows[-1] > recent_lows[-2]
             lh = recent_highs[-1] < recent_highs[-2]
             ll = recent_lows[-1] < recent_lows[-2]
 
-            if hh or hl:
-                trend = "BULLISH" if (hh and hl) else "WEAK_BULLISH"
+            if hh and hl:
+                swing_trend = "BULLISH"
+            elif lh and ll:
+                swing_trend = "BEARISH"
+            elif hh or hl:
+                swing_trend = "WEAK_BULLISH"
             elif lh or ll:
-                trend = "BEARISH" if (lh and ll) else "WEAK_BEARISH"
+                swing_trend = "WEAK_BEARISH"
+
+        # Combine: If primary and swing conflict, primary wins but we note weakness
+        if primary_trend == "BULLISH" and swing_trend in ["BEARISH", "WEAK_BEARISH"]:
+            trend = "BULLISH_PULLBACK"  # Uptrend but local pullback
+        elif primary_trend == "BEARISH" and swing_trend in ["BULLISH", "WEAK_BULLISH"]:
+            trend = "BEARISH_PULLBACK"  # Downtrend but local bounce
+        else:
+            trend = primary_trend if primary_trend != "SIDEWAYS" else swing_trend
 
         return trend, recent_highs, recent_lows
 
@@ -185,6 +217,64 @@ class TechnicalAnalyzer:
         support = max([l for l in swing_lows if l < current_price]) if [l for l in swing_lows if l < current_price] else None
         resistance = min([h for h in swing_highs if h > current_price]) if [h for h in swing_highs if h > current_price] else None
         return support, resistance
+
+    def _calculate_fibonacci_zones(self, df: pd.DataFrame, swing_highs: list, swing_lows: list) -> Dict:
+        """Calculate Fibonacci retracement zones from recent swing high/low."""
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return {}
+
+        current_price = df["close"].iloc[-1]
+
+        # Find the most significant recent swing
+        recent_high = max(swing_highs[-3:]) if len(swing_highs) >= 3 else swing_highs[-1]
+        recent_low = min(swing_lows[-3:]) if len(swing_lows) >= 3 else swing_lows[-1]
+
+        if recent_high <= recent_low:
+            return {}
+
+        range_size = recent_high - recent_low
+
+        # Fib levels
+        fib_levels = {
+            "0.0": recent_high,
+            "23.6": recent_high - range_size * 0.236,
+            "38.2": recent_high - range_size * 0.382,
+            "50.0": recent_high - range_size * 0.500,
+            "61.8": recent_high - range_size * 0.618,
+            "78.6": recent_high - range_size * 0.786,
+            "100.0": recent_low,
+        }
+
+        # Find nearest zone
+        nearest_level = None
+        min_distance = float("inf")
+        for level, price in fib_levels.items():
+            dist = abs(current_price - price) / range_size
+            if dist < min_distance:
+                min_distance = dist
+                nearest_level = level
+
+        # Position: 0-100 scale (0 = at high, 100 = at low)
+        position = ((recent_high - current_price) / range_size) * 100 if range_size > 0 else 50
+
+        # Key zones for signals
+        in_golden_zone = fib_levels["61.8"] <= current_price <= fib_levels["78.6"]
+        in_premium_zone = current_price >= fib_levels["23.6"]
+        in_discount_zone = current_price <= fib_levels["78.6"]
+
+        return {
+            "levels": fib_levels,
+            "nearest_level": nearest_level,
+            "nearest_zone": fib_levels.get(nearest_level),
+            "distance_to_nearest": min_distance,
+            "position": position,
+            "in_golden_zone": in_golden_zone,      # 61.8-78.6% — best BUY zone in uptrend
+            "in_premium_zone": in_premium_zone,    # 0-23.6% — best SELL zone in downtrend
+            "in_discount_zone": in_discount_zone,  # 78.6-100% — deep discount
+            "swing_high": recent_high,
+            "swing_low": recent_low,
+            "range": range_size
+        }
 
     def _detect_liquidity_sweep(self, df: pd.DataFrame, support: Optional[float], resistance: Optional[float]) -> Tuple[Optional[str], float]:
         if len(df) < 5:
@@ -229,23 +319,28 @@ class TechnicalAnalyzer:
 
         lower_wick = min(current['open'], current['close']) - current['low']
         upper_wick = current['high'] - max(current['open'], current['close'])
+        rsi = df['rsi'].iloc[-1] if 'rsi' in df else 50
 
+        # STRONGER: Require RSI confirmation for early signals
         if lower_wick > body * 1.5 and current['close'] > current['open']:
             recent_low = df['low'].tail(10).min()
             if current['low'] <= recent_low * 1.002:
-                rsi = df['rsi'].iloc[-1] if 'rsi' in df else 50
-                if rsi <= 45:
+                if rsi <= 40:  # Stricter: must be oversold
                     return "BUY_EARLY", 0.65
-                return "BUY_EARLY", 0.50
+                elif rsi <= 45:
+                    return "BUY_EARLY", 0.50
+                return None, 0.0  # No signal if RSI not supportive
 
         if upper_wick > body * 1.5 and current['close'] < current['open']:
             recent_high = df['high'].tail(10).max()
             if current['high'] >= recent_high * 0.998:
-                rsi = df['rsi'].iloc[-1] if 'rsi' in df else 50
-                if rsi >= 55:
+                if rsi >= 60:  # Stricter: must be overbought
                     return "SELL_EARLY", 0.65
-                return "SELL_EARLY", 0.50
+                elif rsi >= 55:
+                    return "SELL_EARLY", 0.50
+                return None, 0.0  # No signal if RSI not supportive
 
+        # Engulfing patterns (keep as-is, they're stronger)
         if current['close'] > current['open'] and prev['close'] < prev['open']:
             if current['open'] <= prev['close'] and current['close'] >= prev['open']:
                 return "BUY_EARLY", 0.60
@@ -309,12 +404,19 @@ class TechnicalAnalyzer:
                              support: Optional[float], resistance: Optional[float],
                              df: pd.DataFrame, live_reversal: Optional[str], live_score: float,
                              div_type: str, div_score: float, pattern_result: Dict,
-                             fakeout_result: Dict) -> Tuple[float, str, str]:
+                             fakeout_result: Dict, fib_zones: Dict) -> Tuple[float, str, str]:
         reasons = []
         score = 0.0
         current_price = df["close"].iloc[-1]
         current_ema200 = df["ema_200"].iloc[-1] if "ema_200" in df else current_price
         is_macro_uptrend = current_price > current_ema200
+        is_macro_downtrend = current_price < current_ema200
+
+        # FIBONACCI POSITION
+        fib_position = fib_zones.get("position", 50) if fib_zones else 50
+        in_golden_zone = fib_zones.get("in_golden_zone", False) if fib_zones else False
+        in_premium_zone = fib_zones.get("in_premium_zone", False) if fib_zones else False
+        nearest_fib = fib_zones.get("nearest_level", "50.0") if fib_zones else "50.0"
 
         # STEP 1: FAKEOUT CHECK
         fakeout_blocks = False
@@ -325,12 +427,12 @@ class TechnicalAnalyzer:
         if fakeout_result.get("fakeout_detected", False):
             trap_type = fakeout_result.get("trap_type", "UNKNOWN")
             reasons.append(f"FAKEOUT: {trap_type} (risk: {fakeout_risk*100:.0f}%, real: {fakeout_direction})")
-            if fakeout_risk >= 0.50:
+            if fakeout_risk >= 0.40:  # LOWERED from 0.50 for earlier protection
                 fakeout_blocks = True
                 if fakeout_direction == "BULLISH":
-                    fakeout_boost = fakeout_risk * 0.25
+                    fakeout_boost = fakeout_risk * 0.30
                 elif fakeout_direction == "BEARISH":
-                    fakeout_boost = -fakeout_risk * 0.25
+                    fakeout_boost = -fakeout_risk * 0.30
 
         # STEP 2: CANDLESTICK PATTERNS
         cs_bullish = pattern_result.get("bullish_score", 0.0)
@@ -360,16 +462,28 @@ class TechnicalAnalyzer:
             reasons.append(f"DIVERGENCE: Bearish (score: {div_score:.2f})")
             score -= div_score
 
-        # STEP 5: LIQUIDITY SWEEP (SMC CORE)
+        # STEP 5: LIQUIDITY SWEEP (SMC CORE) + FIBONACCI + TREND FILTER
         if sweep_type == "BUY_SWEEP":
-            if not is_macro_uptrend:
-                reasons.append(f"WARN: Price {current_price:.2f} < 200 EMA {current_ema200:.2f}")
-                score *= 0.7
-            else:
-                reasons.append("OK: Price above 200 EMA")
+            # HARD BLOCK: No BUY in macro downtrend
+            if is_macro_downtrend:
+                reasons.append(f"BLOCKED: Price {current_price:.2f} < 200 EMA {current_ema200:.2f} — No BUY in downtrend")
+                score = 0.0
+                signal = "HOLD"
+                return abs(score), signal, "\\n".join(reasons)
 
             reasons.append(f"SWEEP: Buy at Support {support:.2f} (quality: {sweep_quality:.2f})")
             score += 0.4 * sweep_quality
+
+            # FIBONACCI BONUS: Buy in golden zone (61.8-78.6%) = +0.25
+            if in_golden_zone:
+                reasons.append(f"FIB: Golden zone {nearest_fib}% — deep discount (+0.25)")
+                score += 0.25
+            elif fib_position > 50:
+                reasons.append(f"FIB: Below 50% at {nearest_fib}% — discount (+0.10)")
+                score += 0.10
+            elif fib_position < 30:
+                reasons.append(f"FIB: Premium zone {nearest_fib}% — caution (-0.15)")
+                score -= 0.15
 
             if rsi <= self.rsi_buy_low and rsi_momentum > 0:
                 reasons.append(f"RSI turning up from {rsi:.1f} (mom: +{rsi_momentum:.2f})")
@@ -382,19 +496,38 @@ class TechnicalAnalyzer:
                 reasons.append("Momentum: higher lows")
                 score += 0.2
 
-            if trend in ["BULLISH", "WEAK_BULLISH", "SIDEWAYS"]:
-                reasons.append(f"Trend {trend} aligns")
+            # Trend alignment
+            if trend in ["BULLISH", "BULLISH_PULLBACK"]:
+                reasons.append(f"Trend {trend} aligns strongly")
+                score += 0.2
+            elif trend in ["WEAK_BULLISH", "SIDEWAYS"]:
+                reasons.append(f"Trend {trend} — moderate alignment")
                 score += 0.1
+            elif trend in ["BEARISH", "BEARISH_PULLBACK", "WEAK_BEARISH"]:
+                reasons.append(f"Trend {trend} — counter-trend warning")
+                score -= 0.3
 
         elif sweep_type == "SELL_SWEEP":
+            # HARD BLOCK: No SELL in macro uptrend
             if is_macro_uptrend:
-                reasons.append(f"WARN: Price {current_price:.2f} > 200 EMA {current_ema200:.2f}")
-                score *= 0.7
-            else:
-                reasons.append("OK: Price below 200 EMA")
+                reasons.append(f"BLOCKED: Price {current_price:.2f} > 200 EMA {current_ema200:.2f} — No SELL in uptrend")
+                score = 0.0
+                signal = "HOLD"
+                return abs(score), signal, "\\n".join(reasons)
 
             reasons.append(f"SWEEP: Sell at Resistance {resistance:.2f} (quality: {sweep_quality:.2f})")
             score -= 0.4 * sweep_quality
+
+            # FIBONACCI BONUS: Sell in premium zone (0-23.6%) = -0.25
+            if in_premium_zone and fib_position < 25:
+                reasons.append(f"FIB: Premium zone {nearest_fib}% — overextended (-0.25)")
+                score -= 0.25
+            elif fib_position < 50:
+                reasons.append(f"FIB: Above 50% at {nearest_fib}% — premium (-0.10)")
+                score -= 0.10
+            elif fib_position > 70:
+                reasons.append(f"FIB: Deep discount {nearest_fib}% — caution for SELL (+0.15)")
+                score += 0.15
 
             if rsi >= self.rsi_sell_high and rsi_momentum < 0:
                 reasons.append(f"RSI turning down from {rsi:.1f} (mom: {rsi_momentum:.2f})")
@@ -407,20 +540,39 @@ class TechnicalAnalyzer:
                 reasons.append("Momentum: lower highs")
                 score -= 0.2
 
-            if trend in ["BEARISH", "WEAK_BEARISH", "SIDEWAYS"]:
-                reasons.append(f"Trend {trend} aligns")
+            # Trend alignment
+            if trend in ["BEARISH", "BEARISH_PULLBACK"]:
+                reasons.append(f"Trend {trend} aligns strongly")
+                score -= 0.2
+            elif trend in ["WEAK_BEARISH", "SIDEWAYS"]:
+                reasons.append(f"Trend {trend} — moderate alignment")
                 score -= 0.1
+            elif trend in ["BULLISH", "BULLISH_PULLBACK", "WEAK_BULLISH"]:
+                reasons.append(f"Trend {trend} — counter-trend warning")
+                score += 0.3  # Reduces bearish score
+
         else:
+            # NO SWEEP: Use Fibonacci + pattern + divergence only
             if score == 0:
                 reasons.append("Monitoring: No clear setup")
+            
+            # Fibonacci guidance even without sweep
+            if fib_zones:
+                if in_golden_zone and is_macro_uptrend:
+                    reasons.append(f"FIB: Golden zone {nearest_fib}% in uptrend — watch for BUY setup")
+                    score += 0.05
+                elif in_premium_zone and is_macro_downtrend and fib_position < 25:
+                    reasons.append(f"FIB: Premium zone {nearest_fib}% in downtrend — watch for SELL setup")
+                    score -= 0.05
 
         # STEP 6: APPLY FAKEOUT BOOST
         score += fakeout_boost
 
-        # STEP 7: DETERMINE SIGNAL
+        # STEP 7: DETERMINE SIGNAL — RAISED THRESHOLDS
         signal = "HOLD"
 
-        if fakeout_blocks and fakeout_risk >= 0.50:
+        # Fakeout override
+        if fakeout_blocks and fakeout_risk >= 0.40:
             if fakeout_direction == "BULLISH" and score < 0:
                 reasons.append("BLOCKED: Fakeout override (BULLISH)")
                 signal = "HOLD"
@@ -431,12 +583,12 @@ class TechnicalAnalyzer:
                 score = min(score, 0.0)
 
         if signal == "HOLD":
-            if score >= 0.45:
+            if score >= 0.60:      # RAISED from 0.45
                 signal = "BUY"
-            elif score <= -0.45:
+            elif score <= -0.60:   # RAISED from -0.45
                 signal = "SELL"
 
-        return abs(score), signal, "\n".join(reasons)
+        return abs(score), signal, "\\n".join(reasons)
 
     def _calculate_levels(self, signal: str, df: pd.DataFrame, support: Optional[float], resistance: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         current_price = df["close"].iloc[-1]

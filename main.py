@@ -1,6 +1,6 @@
-# main.py - AI Crypto Signal Bot v4.0 (Production Ready)
-# FAST VERSION — 5m candles, 10s checks, pure price action
-# NO LSTM — Candlestick + Live Reversal + RSI Divergence + Fakeout + SMC
+# main.py - AI Crypto Signal Bot v4.1 (Production Ready)
+# FAST VERSION — 5m candles, 5min checks, pure price action
+# NO LSTM — Candlestick + Live Reversal + RSI Divergence + Fakeout + SMC + Fibonacci
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -45,9 +45,9 @@ app_state = {'is_running': False, 'engine': None, 'last_signals': {}}
 
 class CloudForexEngine:
     def __init__(self):
-        # FAST: 5m timeframe, 10s check interval
+        # v4.1: 5m timeframe, 5min check interval (was 10s — too noisy!)
         self.pairs_config = {
-            "BTCUSD": {"source": "kraken", "tf": "5m", "check_interval": 10}
+            "BTCUSD": {"source": "kraken", "tf": "5m", "check_interval": 300}
         }
         self.tasks = {}
         self.health = {}
@@ -56,10 +56,10 @@ class CloudForexEngine:
         self.notification_manager = None
         self.filter_managers = {}
         self.analyzer = TechnicalAnalyzer()
-        logger.info("CloudForexEngine v4.0 initialized | FAST: 5m candles, 10s checks | BTCUSD only | No LSTM")
+        logger.info("CloudForexEngine v4.1 initialized | 5m candles, 5min checks | BTCUSD only | Fibonacci + Trend Filter")
 
     async def initialize(self):
-        logger.info("Initializing Engine v4.0...")
+        logger.info("Initializing Engine v4.1...")
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
@@ -67,14 +67,15 @@ class CloudForexEngine:
             # Send startup test message to Telegram
             try:
                 await self.notification_manager.send_test_message(
-                    "🤖 AI Crypto Bot v4.0 is ONLINE!\n"
-                    "━━━━━━━━━━━━━━━━━━━\n"
-                    "✅ Monitoring: BTCUSD only\n"
-                    "📡 Source: Kraken\n"
-                    "⚡ FAST MODE: 5m candles / 10s checks\n"
-                    "🎯 Signals: Candlestick + Live Reversal + RSI Div + Fakeout + SMC\n"
-                    "🧠 NO LSTM — Pure Price Action\n"
-                    "⚙️ Version: 4.0 FAST"
+                    "🤖 AI Crypto Bot v4.1 is ONLINE!\\n"
+                    "━━━━━━━━━━━━━━━━━━━\\n"
+                    "✅ Monitoring: BTCUSD only\\n"
+                    "📡 Source: Kraken\\n"
+                    "⚡ 5m candles / 5min checks\\n"
+                    "🎯 Signals: Candlestick + Live Reversal + RSI Div + Fakeout + SMC + Fibonacci\\n"
+                    "🔒 HARD TREND FILTER: No counter-trend signals\\n"
+                    "🧠 NO LSTM — Pure Price Action\\n"
+                    "⚙️ Version: 4.1"
                 )
                 logger.info("Startup test message sent to Telegram")
             except Exception as e:
@@ -89,7 +90,7 @@ class CloudForexEngine:
                     'last_signal': None
                 }
             app_state['is_running'] = True
-            logger.info("Engine v4.0 initialization complete!")
+            logger.info("Engine v4.1 initialization complete!")
         except Exception as e:
             logger.error(f"Engine initialization failed: {e}")
             raise
@@ -108,7 +109,8 @@ class CloudForexEngine:
 
     async def monitor_pair(self, pair: str):
         config = self.pairs_config[pair]
-        logger.info(f"Starting FAST monitor for {pair} ({config['source']}) | {config['tf']} candles every {config['check_interval']}s")
+        logger.info(f"Starting monitor for {pair} ({config['source']}) | {config['tf']} candles every {config['check_interval']}s")
+        
         while app_state['is_running']:
             try:
                 start_time = asyncio.get_event_loop().time()
@@ -144,25 +146,31 @@ class CloudForexEngine:
                 fakeout_detected = indicators.get('fakeout_detected', False)
                 fakeout_direction = indicators.get('fakeout_direction')
                 fakeout_risk = indicators.get('fakeout_risk', 0.0)
+                market_structure = indicators.get('market_structure', 'SIDEWAYS')
+                
+                # FIBONACCI info for logging
+                fib_zones = indicators.get('fib_zones', {})
+                nearest_fib = fib_zones.get('nearest_level', 'N/A') if fib_zones else 'N/A'
+                fib_position = fib_zones.get('position', 50) if fib_zones else 50
 
                 # EARLY WARNING: Setup forming but not confirmed yet
-                if smc_score >= 0.20 and smc_score < 0.45:
+                if smc_score >= 0.20 and smc_score < 0.60:
                     if rsi <= 45 and rsi_momentum > 0 and smc_signal == 'BUY':
-                        logger.info(f"⚠️ EARLY WARNING: {pair} BUY setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f})")
+                        logger.info(f"⚠️ EARLY WARNING: {pair} BUY setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f}, Fib: {nearest_fib}%)")
                     elif rsi >= 55 and rsi_momentum < 0 and smc_signal == 'SELL':
-                        logger.info(f"⚠️ EARLY WARNING: {pair} SELL setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f})")
+                        logger.info(f"⚠️ EARLY WARNING: {pair} SELL setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f}, Fib: {nearest_fib}%)")
 
-                # Determine if this is an early signal (2/4 filters) or confirmed (3/4)
+                # Determine if this is an early signal (0.60-0.75) or confirmed (0.75+)
                 is_early = False
                 final_signal = "HOLD"
                 final_confidence = 0.0
                 prediction_source = "CONFLUENCE"
 
-                if smc_signal in ['BUY', 'SELL'] and smc_score >= 0.45:
+                if smc_signal in ['BUY', 'SELL'] and smc_score >= 0.60:
                     final_signal = smc_signal
                     final_confidence = smc_score
 
-                    if smc_score >= 0.45 and smc_score < 0.60:
+                    if smc_score >= 0.60 and smc_score < 0.75:
                         is_early = True
                         prediction_source = "CONFLUENCE_EARLY"
                     else:
@@ -177,7 +185,7 @@ class CloudForexEngine:
 
                     if filter_passed:
                         # Check fakeout blocking
-                        if fakeout_detected and fakeout_risk >= 0.50:
+                        if fakeout_detected and fakeout_risk >= 0.40:
                             should_block, block_reason = self.analyzer.fakeout_detector.should_block_signal(
                                 {"fakeout_detected": fakeout_detected, "fakeout_direction": fakeout_direction,
                                  "fakeout_risk": fakeout_risk, "trap_type": indicators.get('fakeout_trap_type')},
@@ -227,6 +235,9 @@ class CloudForexEngine:
                             'source': prediction_source,
                             'is_early': is_early,
                             'confluence_score': smc_score,
+                            'market_structure': market_structure,
+                            'fib_zone': nearest_fib,
+                            'fib_position': fib_position,
                             'live_reversal': live_reversal,
                             'rsi_divergence': div_type,
                             'candlestick_signal': cs_signal,
@@ -242,12 +253,15 @@ class CloudForexEngine:
                         self.health[pair]['signals_today'] += 1
                         self.health[pair]['last_signal'] = signal_data
                         label = "🚨 EARLY" if is_early else "🚀 CONFIRMED"
-                        logger.info(f"{label} SIGNAL SENT: {pair} {final_signal} @ {current_price:.2f} (conf: {adjusted_confidence:.2%}) [Source: {prediction_source}]")
+                        logger.info(f"{label} SIGNAL SENT: {pair} {final_signal} @ {current_price:.2f} (conf: {adjusted_confidence:.2%}) [Source: {prediction_source}] [Fib: {nearest_fib}%]")
                     else:
                         reason = filter_report.get('filters', {}).get('cooldown_check', {}).get('reason', 'Filter blocked')
-                        logger.info(f"FILTER DEBUG: {pair} {final_signal} rejected. Reason: {reason}")
+                        # Log which filter blocked it
+                        for filter_name, filter_result in filter_report.get('filters', {}).items():
+                            if not filter_result.get('passed', True):
+                                logger.info(f"FILTER BLOCK: {pair} {final_signal} — {filter_name}: {filter_result.get('reason', 'unknown')}")
                 else:
-                    logger.debug(f"FILTER DEBUG: {pair} no valid signal. SMC: {smc_signal}({smc_score:.2f}) | CS: {cs_signal}({cs_confidence:.2f}) | Live: {live_reversal} | Div: {div_type}")
+                    logger.debug(f"FILTER DEBUG: {pair} no valid signal. SMC: {smc_signal}({smc_score:.2f}) | CS: {cs_signal}({cs_confidence:.2f}) | Live: {live_reversal} | Div: {div_type} | Fib: {nearest_fib}%")
 
                 self.health[pair]['status'] = 'healthy'
                 self.health[pair]['last_check'] = asyncio.get_event_loop().time()
@@ -277,7 +291,7 @@ class CloudForexEngine:
             await self.notification_manager.close()
         if redis_client:
             await redis_client.close()
-        logger.info("Engine v4.0 stopped")
+        logger.info("Engine v4.1 stopped")
 
 
 @asynccontextmanager
@@ -291,8 +305,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Crypto Signal Bot",
-    description="BTCUSD pattern prediction with Telegram alerts — v4.0 No LSTM",
-    version="4.0",
+    description="BTCUSD pattern prediction with Telegram alerts — v4.1 Fibonacci + Trend Filter",
+    version="4.1",
     lifespan=lifespan
 )
 
@@ -309,8 +323,8 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "pairs": list(app_state.get('engine', {}).pairs_config.keys() if app_state.get('engine') else []),
-        "version": "4.0",
-        "mode": "FAST — Pure Price Action (No LSTM)"
+        "version": "4.1",
+        "mode": "5m candles — Pure Price Action + Fibonacci + Trend Filter (No LSTM)"
     }
 
 
@@ -321,7 +335,7 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "4.0",
+        "version": "4.1",
         "pairs": {
             pair: {
                 "status": info['status'],
@@ -365,3 +379,4 @@ if __name__ == "__main__":
         workers=1,
         loop="asyncio"
     )
+

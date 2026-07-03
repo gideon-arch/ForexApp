@@ -127,4 +127,3 @@ class DataFeedManager:
         except Exception as e:
             logger.error(f"Kraken fetch error for {kraken_pair}: {e}")
             return None
-

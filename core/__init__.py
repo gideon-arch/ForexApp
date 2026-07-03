@@ -1,6 +1,3 @@
-# core/__init__.py
-# AI Crypto Signal Bot v4.0 — Core Modules (No LSTM)
-
 from .data_feed import DataFeedManager
 from .technical_analysis import TechnicalAnalyzer
 from .filters import FilterManager
@@ -17,4 +14,3 @@ __all__ = [
     'CandlestickPatternRecognizer',
     'FakeoutDetector',
 ]
-

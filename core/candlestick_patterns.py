@@ -1,6 +1,6 @@
 # core/candlestick_patterns.py
 # Real-time candlestick pattern recognition for EARLY reversal detection
-# v2: Added triangle consolidation detection
+# v2.1: Added triangle consolidation detection + IMPROVED symmetrical triangle logic
 
 import numpy as np
 import pandas as pd
@@ -15,7 +15,7 @@ class CandlestickPatternRecognizer:
 
     def __init__(self):
         self.patterns_detected = {}
-        logger.info("CandlestickPatternRecognizer initialized")
+        logger.info("CandlestickPatternRecognizer v2.1 initialized")
 
     def analyze(self, df: pd.DataFrame) -> Dict:
         if len(df) < 5:
@@ -213,9 +213,15 @@ class CandlestickPatternRecognizer:
         return patterns
 
     def _detect_triangle(self, df: pd.DataFrame, lookback: int = 20) -> Optional[Dict]:
+        """Detect symmetrical/ascending/descending triangles with trend alignment."""
         if len(df) < lookback + 2:
             return None
         window = df.tail(lookback).reset_index(drop=True)
+        
+        # Get trend BEFORE the triangle (for alignment check)
+        pre_triangle = df.iloc[-lookback-10:-lookback] if len(df) >= lookback + 10 else df.iloc[:lookback]
+        pre_trend = self._get_simple_trend(pre_triangle)
+        
         swing_high_idx, swing_high_val = [], []
         swing_low_idx, swing_low_val = [], []
         for i in range(1, len(window) - 1):
@@ -227,16 +233,20 @@ class CandlestickPatternRecognizer:
                 window['low'].iloc[i] < window['low'].iloc[i + 1]):
                 swing_low_idx.append(i)
                 swing_low_val.append(window['low'].iloc[i])
+        
         if len(swing_high_idx) < 2 or len(swing_low_idx) < 2:
             return None
+        
         high_slope, high_intercept = np.polyfit(swing_high_idx, swing_high_val, 1)
         low_slope, low_intercept = np.polyfit(swing_low_idx, swing_low_val, 1)
         avg_price = window['close'].mean()
         flat_threshold = avg_price * 0.0003
+        
         highs_falling = high_slope < -flat_threshold
         highs_flat = abs(high_slope) <= flat_threshold
         lows_rising = low_slope > flat_threshold
         lows_flat = abs(low_slope) <= flat_threshold
+        
         triangle_type = None
         if highs_falling and lows_rising:
             triangle_type = "SYMMETRICAL"
@@ -246,38 +256,102 @@ class CandlestickPatternRecognizer:
             triangle_type = "DESCENDING"
         else:
             return None
+        
         last_x = len(window) - 1
         upper_now = high_slope * last_x + high_intercept
         lower_now = low_slope * last_x + low_intercept
+        
         if upper_now <= lower_now:
             return None
+        
         range_start = high_intercept - low_intercept
         range_now = upper_now - lower_now
         if range_now >= range_start * 0.85:
             return None
+        
         apex_distance = None
         if high_slope != low_slope:
             apex_x = (low_intercept - high_intercept) / (high_slope - low_slope)
             apex_distance = max(int(apex_x - last_x), 0)
+        
         result = {
             "type": triangle_type, "armed": True, "apex_distance": apex_distance,
-            "upper_level": float(upper_now), "lower_level": float(lower_now), "breakout_signal": None
+            "upper_level": float(upper_now), "lower_level": float(lower_now),
+            "pre_trend": pre_trend,
+            "breakout_signal": None
         }
+        
         last_candle = df.iloc[-1]
         breakout_buffer = avg_price * 0.0005
+        
+        # IMPROVED: Check trend alignment for symmetrical triangles
+        # Symmetrical triangles are continuation patterns ~75% of the time
         if last_candle['close'] > upper_now + breakout_buffer:
+            # Breakout UP
+            if triangle_type == "SYMMETRICAL":
+                # In uptrend: strong continuation (75% probability)
+                # In downtrend: potential reversal (25% probability)
+                if pre_trend == "BULLISH":
+                    strength = 0.85
+                    direction = "BULLISH"
+                elif pre_trend == "BEARISH":
+                    strength = 0.55  # Lower confidence for counter-trend
+                    direction = "BULLISH"
+                else:
+                    strength = 0.70
+                    direction = "BULLISH"
+            elif triangle_type == "ASCENDING":
+                strength = 0.80
+                direction = "BULLISH"
+            else:  # DESCENDING
+                strength = 0.55  # Counter-trend breakout
+                direction = "BULLISH"
+            
             result["breakout_signal"] = {
-                "name": f"TRIANGLE_BREAKOUT_{triangle_type}", "direction": "BULLISH",
-                "strength": 0.75 if triangle_type != "DESCENDING" else 0.55,
-                "description": f"{triangle_type} triangle breakout above {upper_now:.2f}"
+                "name": f"TRIANGLE_BREAKOUT_{triangle_type}", "direction": direction,
+                "strength": strength,
+                "description": f"{triangle_type} triangle breakout above {upper_now:.2f} (pre-trend: {pre_trend})"
             }
+            
         elif last_candle['close'] < lower_now - breakout_buffer:
+            # Breakout DOWN
+            if triangle_type == "SYMMETRICAL":
+                if pre_trend == "BEARISH":
+                    strength = 0.85
+                    direction = "BEARISH"
+                elif pre_trend == "BULLISH":
+                    strength = 0.55  # Lower confidence for counter-trend
+                    direction = "BEARISH"
+                else:
+                    strength = 0.70
+                    direction = "BEARISH"
+            elif triangle_type == "DESCENDING":
+                strength = 0.80
+                direction = "BEARISH"
+            else:  # ASCENDING
+                strength = 0.55  # Counter-trend breakout
+                direction = "BEARISH"
+            
             result["breakout_signal"] = {
-                "name": f"TRIANGLE_BREAKOUT_{triangle_type}", "direction": "BEARISH",
-                "strength": 0.75 if triangle_type != "ASCENDING" else 0.55,
-                "description": f"{triangle_type} triangle breakdown below {lower_now:.2f}"
+                "name": f"TRIANGLE_BREAKOUT_{triangle_type}", "direction": direction,
+                "strength": strength,
+                "description": f"{triangle_type} triangle breakdown below {lower_now:.2f} (pre-trend: {pre_trend})"
             }
+        
         return result
+
+    def _get_simple_trend(self, df: pd.DataFrame) -> str:
+        """Quick trend check for pre-triangle alignment."""
+        if len(df) < 10:
+            return "SIDEWAYS"
+        first_price = df['close'].iloc[0]
+        last_price = df['close'].iloc[-1]
+        change = (last_price - first_price) / first_price
+        if change > 0.01:
+            return "BULLISH"
+        elif change < -0.01:
+            return "BEARISH"
+        return "SIDEWAYS"
 
     def get_pattern_summary(self, patterns: List[Dict]) -> str:
         if not patterns:
@@ -287,4 +361,3 @@ class CandlestickPatternRecognizer:
             emoji = "B" if p['direction'] == 'BULLISH' else "S"
             lines.append(f"{emoji}:{p['name']}({p['strength']*100:.0f}%)")
         return " | ".join(lines)
-

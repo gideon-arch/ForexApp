@@ -67,14 +67,14 @@ class CloudForexEngine:
             # Send startup test message to Telegram
             try:
                 await self.notification_manager.send_test_message(
-                    "🤖 AI Crypto Bot v4.1 is ONLINE!\\n"
-                    "━━━━━━━━━━━━━━━━━━━\\n"
-                    "✅ Monitoring: BTCUSD only\\n"
-                    "📡 Source: Kraken\\n"
-                    "⚡ 5m candles / 5min checks\\n"
-                    "🎯 Signals: Candlestick + Live Reversal + RSI Div + Fakeout + SMC + Fibonacci\\n"
-                    "🔒 HARD TREND FILTER: No counter-trend signals\\n"
-                    "🧠 NO LSTM — Pure Price Action\\n"
+                    "🤖 AI Crypto Bot v4.1 is ONLINE!\n"
+                    "━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ Monitoring: BTCUSD only\n"
+                    "📡 Source: Kraken\n"
+                    "⚡ 5m candles / 5min checks\n"
+                    "🎯 Signals: Candlestick + Live Reversal + RSI Div + Fakeout + SMC + Fibonacci\n"
+                    "🔒 HARD TREND FILTER: No counter-trend signals\n"
+                    "🧠 NO LSTM — Pure Price Action\n"
                     "⚙️ Version: 4.1"
                 )
                 logger.info("Startup test message sent to Telegram")

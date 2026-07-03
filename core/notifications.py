@@ -166,4 +166,3 @@ class NotificationManager:
         if self.session and not self.session.closed:
             await self.session.close()
             logger.info("NotificationManager session closed")
-

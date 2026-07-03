@@ -469,7 +469,7 @@ class TechnicalAnalyzer:
                 reasons.append(f"BLOCKED: Price {current_price:.2f} < 200 EMA {current_ema200:.2f} — No BUY in downtrend")
                 score = 0.0
                 signal = "HOLD"
-                return abs(score), signal, "\\n".join(reasons)
+                return abs(score), signal, "\n".join(reasons)
 
             reasons.append(f"SWEEP: Buy at Support {support:.2f} (quality: {sweep_quality:.2f})")
             score += 0.4 * sweep_quality
@@ -513,7 +513,7 @@ class TechnicalAnalyzer:
                 reasons.append(f"BLOCKED: Price {current_price:.2f} > 200 EMA {current_ema200:.2f} — No SELL in uptrend")
                 score = 0.0
                 signal = "HOLD"
-                return abs(score), signal, "\\n".join(reasons)
+                return abs(score), signal, "\n".join(reasons)
 
             reasons.append(f"SWEEP: Sell at Resistance {resistance:.2f} (quality: {sweep_quality:.2f})")
             score -= 0.4 * sweep_quality
@@ -588,7 +588,7 @@ class TechnicalAnalyzer:
             elif score <= -0.60:   # RAISED from -0.45
                 signal = "SELL"
 
-        return abs(score), signal, "\\n".join(reasons)
+        return abs(score), signal, "\n".join(reasons)
 
     def _calculate_levels(self, signal: str, df: pd.DataFrame, support: Optional[float], resistance: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         current_price = df["close"].iloc[-1]
@@ -671,4 +671,3 @@ class TechnicalAnalyzer:
             score += weights["bb"] * (0.5 - bb_pos) * 2
 
         return float(np.clip(score, -1, 1))
-

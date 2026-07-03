@@ -204,6 +204,16 @@ class CloudForexEngine:
                         confidence_boost = filter_report.get('confidence_boost', 1.0)
                         adjusted_confidence = min(final_confidence * confidence_boost, 0.99)
 
+                        # SKIP: Don't send signals with adjusted confidence below 50%
+                        if adjusted_confidence < 0.50:
+                            logger.info(f"LOW CONFIDENCE SKIP: {pair} {final_signal} raw={final_confidence:.2%} adjusted={adjusted_confidence:.2%}")
+                            self.health[pair]['status'] = 'healthy'
+                            self.health[pair]['last_check'] = asyncio.get_event_loop().time()
+                            elapsed = asyncio.get_event_loop().time() - start_time
+                            sleep_time = max(5, config['check_interval'] - elapsed)
+                            await asyncio.sleep(sleep_time)
+                            continue
+
                         urgency = 'high' if adjusted_confidence > 0.85 else 'normal' if adjusted_confidence > 0.60 else 'low'
                         if is_early:
                             urgency = 'normal'

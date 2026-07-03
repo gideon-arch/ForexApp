@@ -285,3 +285,4 @@ class FilterManager:
             "cooldown_minutes": self.min_interval.total_seconds() / 60,
             "early_cooldown_minutes": self.early_interval.total_seconds() / 60
         }
+

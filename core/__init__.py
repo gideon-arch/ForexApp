@@ -1,3 +1,7 @@
+# core/__init__.py
+# AI Crypto Signal Bot v4.1 — Core Modules (No LSTM)
+# Added: Fibonacci zones, improved trend filter, symmetrical triangle alignment
+
 from .data_feed import DataFeedManager
 from .technical_analysis import TechnicalAnalyzer
 from .filters import FilterManager

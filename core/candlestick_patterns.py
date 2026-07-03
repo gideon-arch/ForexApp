@@ -361,3 +361,4 @@ class CandlestickPatternRecognizer:
             emoji = "B" if p['direction'] == 'BULLISH' else "S"
             lines.append(f"{emoji}:{p['name']}({p['strength']*100:.0f}%)")
         return " | ".join(lines)
+

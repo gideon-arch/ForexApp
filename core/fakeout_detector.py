@@ -1,5 +1,6 @@
 # core/fakeout_detector.py
-# Fakeout (False Breakout) Detection Engine
+# Fakeout (False Breakout) Detection Engine — v5.0
+# REDUCED SENSITIVITY: Hard block only at >= 0.60 risk
 
 import numpy as np
 import pandas as pd
@@ -14,7 +15,7 @@ class FakeoutDetector:
 
     def __init__(self):
         self.fakeout_history = []
-        logger.info("FakeoutDetector initialized")
+        logger.info("FakeoutDetector v5.0 initialized (reduced sensitivity)")
 
     def analyze(self, df: pd.DataFrame, support: Optional[float], resistance: Optional[float],
                 market_structure: str = "SIDEWAYS") -> Dict:
@@ -70,7 +71,7 @@ class FakeoutDetector:
 
         results.sort(key=lambda x: x["confidence"], reverse=True)
         best = results[0]
-        fakeout_risk = min(sum(r["confidence"] for r in results) / len(results) + 0.1, 1.0)
+        fakeout_risk = min(sum(r["confidence"] for r in results) / len(results) + 0.05, 1.0)
 
         return {
             "fakeout_detected": True,
@@ -104,12 +105,12 @@ class FakeoutDetector:
             break_extent = (bc["high"] - resistance) / resistance
             reversal_extent = (resistance - current_price) / resistance
 
-            if break_extent > 0.001 and reversal_extent > break_extent * 0.5:
-                conf = min(0.50 + break_extent * 100 + reversal_extent * 100, 0.95)
+            if break_extent > 0.0015 and reversal_extent > break_extent * 0.5:
+                conf = min(0.45 + break_extent * 80 + reversal_extent * 80, 0.90)
                 body = abs(current_price - current_open)
                 upper_wick = current_high - max(current_price, current_open)
                 if upper_wick > body * 2:
-                    conf = min(conf + 0.15, 0.95)
+                    conf = min(conf + 0.10, 0.90)
                 return {
                     "detected": True,
                     "direction": "BEARISH",
@@ -141,12 +142,12 @@ class FakeoutDetector:
             break_extent = (support - bc["low"]) / support
             reversal_extent = (current_price - support) / support
 
-            if break_extent > 0.001 and reversal_extent > break_extent * 0.5:
-                conf = min(0.50 + break_extent * 100 + reversal_extent * 100, 0.95)
+            if break_extent > 0.0015 and reversal_extent > break_extent * 0.5:
+                conf = min(0.45 + break_extent * 80 + reversal_extent * 80, 0.90)
                 body = abs(current_price - current_open)
                 lower_wick = min(current_price, current_open) - current_low
                 if lower_wick > body * 2:
-                    conf = min(conf + 0.15, 0.95)
+                    conf = min(conf + 0.10, 0.90)
                 return {
                     "detected": True,
                     "direction": "BULLISH",
@@ -176,7 +177,7 @@ class FakeoutDetector:
                 "detected": True,
                 "direction": "NEUTRAL",
                 "trap_type": "RANGE_WHIPSAW",
-                "confidence": 0.60,
+                "confidence": 0.55,
                 "reasoning": f"Whipsaw between {support:.2f} and {resistance:.2f}"
             }
         return {"detected": False, "confidence": 0.0}
@@ -199,7 +200,7 @@ class FakeoutDetector:
                     "detected": True,
                     "direction": "BEARISH",
                     "trap_type": "WICK_REJECTION_RESISTANCE",
-                    "confidence": 0.70,
+                    "confidence": 0.65,
                     "reasoning": f"Upper wick pierced R {resistance:.2f} but closed below"
                 }
 
@@ -210,7 +211,7 @@ class FakeoutDetector:
                     "detected": True,
                     "direction": "BULLISH",
                     "trap_type": "WICK_REJECTION_SUPPORT",
-                    "confidence": 0.70,
+                    "confidence": 0.65,
                     "reasoning": f"Lower wick pierced S {support:.2f} but closed above"
                 }
 
@@ -231,7 +232,7 @@ class FakeoutDetector:
                         "detected": True,
                         "direction": "BEARISH",
                         "trap_type": "MOMENTUM_FAKEOUT_BULL",
-                        "confidence": 0.65,
+                        "confidence": 0.60,
                         "reasoning": f"Price broke toward R but RSI divergence ({rsi_vals[-1]:.1f} vs {rsi_vals[-5]:.1f})"
                     }
 
@@ -242,13 +243,14 @@ class FakeoutDetector:
                         "detected": True,
                         "direction": "BULLISH",
                         "trap_type": "MOMENTUM_FAKEOUT_BEAR",
-                        "confidence": 0.65,
+                        "confidence": 0.60,
                         "reasoning": f"Price broke toward S but RSI divergence ({rsi_vals[-1]:.1f} vs {rsi_vals[-5]:.1f})"
                     }
 
         return {"detected": False, "confidence": 0.0}
 
     def should_block_signal(self, fakeout_result: Dict, proposed_signal: str) -> Tuple[bool, str]:
+        """v5.0: Hard block only at high risk (>= 0.60)"""
         if not fakeout_result["fakeout_detected"]:
             return False, "No fakeout detected"
 
@@ -256,22 +258,16 @@ class FakeoutDetector:
         risk = fakeout_result["fakeout_risk"]
         trap = fakeout_result["trap_type"]
 
-        if risk >= 0.75:
+        if risk >= 0.60:
             if proposed_signal == "BUY" and direction == "BEARISH":
                 return True, f"BLOCKED: {trap} ({risk*100:.0f}% risk). Real move DOWN."
             if proposed_signal == "SELL" and direction == "BULLISH":
                 return True, f"BLOCKED: {trap} ({risk*100:.0f}% risk). Real move UP."
 
-        if risk >= 0.50:
+        if risk >= 0.40:
             if proposed_signal == "BUY" and direction == "BEARISH":
-                return True, f"BLOCKED: {trap} ({risk*100:.0f}% risk). Wait for confirmation."
+                return False, f"WARNING: {trap} ({risk*100:.0f}% risk). Use tight stop."
             if proposed_signal == "SELL" and direction == "BULLISH":
-                return True, f"BLOCKED: {trap} ({risk*100:.0f}% risk). Wait for confirmation."
-
-        if risk >= 0.30:
-            if proposed_signal == "BUY" and direction == "BEARISH":
-                return False, f"WARNING: {trap} possible. Use tight stop."
-            if proposed_signal == "SELL" and direction == "BULLISH":
-                return False, f"WARNING: {trap} possible. Use tight stop."
+                return False, f"WARNING: {trap} ({risk*100:.0f}% risk). Use tight stop."
 
         return False, "Fakeout risk low"

@@ -1,6 +1,6 @@
 # core/__init__.py
-# AI Crypto Signal Bot v4.1 — Core Modules (No LSTM)
-# Added: Fibonacci zones, improved trend filter, symmetrical triangle alignment
+# AI Crypto Signal Bot v5.0 — Multi-Timeframe + Dual Asset
+# Added: Deriv support, MultiTimeframeEngine, duplicate setup prevention
 
 from .data_feed import DataFeedManager
 from .technical_analysis import TechnicalAnalyzer
@@ -8,6 +8,7 @@ from .filters import FilterManager
 from .notifications import NotificationManager, SignalAlert
 from .candlestick_patterns import CandlestickPatternRecognizer
 from .fakeout_detector import FakeoutDetector
+from .multi_timeframe import MultiTimeframeEngine
 
 __all__ = [
     'DataFeedManager',
@@ -17,4 +18,4 @@ __all__ = [
     'SignalAlert',
     'CandlestickPatternRecognizer',
     'FakeoutDetector',
-]
+    'MultiTimeframeEngine',]

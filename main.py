@@ -1,6 +1,7 @@
-# main.py - AI Crypto Signal Bot v4.1 (Production Ready)
-# FAST VERSION — 5m candles, 5min checks, pure price action
-# NO LSTM — Candlestick + Live Reversal + RSI Divergence + Fakeout + SMC + Fibonacci
+# main.py - AI Crypto Signal Bot v5.0
+# Multi-Asset | Multi-Timeframe | /analyze endpoint for cron-job.org
+# BTCUSD (Kraken): 15m -> 5m -> 1m
+# EURUSD (Deriv -> Kraken fallback): 15m -> 5m -> 1m
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,13 +18,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-# Local imports
 from core.data_feed import DataFeedManager
-from core.technical_analysis import TechnicalAnalyzer
+from core.multi_timeframe import MultiTimeframeEngine
 from core.filters import FilterManager
 from core.notifications import NotificationManager, SignalAlert
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
@@ -31,13 +30,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Redis
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
     redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
     logger.info("Redis connected")
 except Exception as e:
-    logger.warning(f"Redis connection failed: {e}")
+    logger.warning(f"Redis failed: {e}")
     redis_client = None
 
 app_state = {'is_running': False, 'engine': None, 'last_signals': {}}
@@ -45,54 +43,68 @@ app_state = {'is_running': False, 'engine': None, 'last_signals': {}}
 
 class CloudForexEngine:
     def __init__(self):
-        # v4.1: 5m timeframe, 5min check interval (was 10s — too noisy!)
-        self.pairs_config = {
-            "BTCUSD": {"source": "kraken", "tf": "5m", "check_interval": 300}
+        self.assets_config = {
+            "BTCUSD": {
+                "source": "kraken",
+                "timeframes": {
+                    "primary":   {"tf": "15m", "deriv_granularity": 900},
+                    "secondary": {"tf": "5m",  "deriv_granularity": 300},
+                    "entry":     {"tf": "1m",  "deriv_granularity": 60}
+                },
+                "check_interval": 300
+            },
+            "frxEURUSD": {
+                "source": "deriv",
+                "display_name": "EURUSD",
+                "timeframes": {
+                    "primary":   {"tf": "15m", "deriv_granularity": 900},
+                    "secondary": {"tf": "5m",  "deriv_granularity": 300},
+                    "entry":     {"tf": "1m",  "deriv_granularity": 60}
+                },
+                "check_interval": 300
+            }
         }
+
         self.tasks = {}
         self.health = {}
-        self.last_sent_signal = {pair: None for pair in self.pairs_config}
         self.data_feed = None
         self.notification_manager = None
         self.filter_managers = {}
-        self.analyzer = TechnicalAnalyzer()
-        logger.info("CloudForexEngine v4.1 initialized | 5m candles, 5min checks | BTCUSD only | Fibonacci + Trend Filter")
+        self.mtf_engine = MultiTimeframeEngine()
+
+        logger.info("CloudForexEngine v5.0 | BTCUSD (Kraken) + EURUSD (Deriv/Kraken fallback)")
 
     async def initialize(self):
-        logger.info("Initializing Engine v4.1...")
+        logger.info("Initializing Engine v5.0...")
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
 
-            # Send startup test message to Telegram
-            try:
-                await self.notification_manager.send_test_message(
-                    "🤖 AI Crypto Bot v4.1 is ONLINE!\n"
-                    "━━━━━━━━━━━━━━━━━━━\n"
-                    "✅ Monitoring: BTCUSD only\n"
-                    "📡 Source: Kraken\n"
-                    "⚡ 5m candles / 5min checks\n"
-                    "🎯 Signals: Candlestick + Live Reversal + RSI Div + Fakeout + SMC + Fibonacci\n"
-                    "🔒 HARD TREND FILTER: No counter-trend signals\n"
-                    "🧠 NO LSTM — Pure Price Action\n"
-                    "⚙️ Version: 4.1"
-                )
-                logger.info("Startup test message sent to Telegram")
-            except Exception as e:
-                logger.warning(f"Failed to send startup message: {e}")
+            await self.notification_manager.send_test_message(
+                "🤖 AI Crypto Bot v5.0 is ONLINE!\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                "✅ Assets: BTCUSD (Kraken) + EURUSD (Deriv/Kraken)\n"
+                "📐 15m → 5m → 1m for both\n"
+                "🎯 Exact Entry + TP + SL\n"
+                "🔄 Kraken fallback active for EURUSD\n"
+                "⚙️ Version: 5.0"
+            )
+            logger.info("Startup message sent")
 
-            for pair in self.pairs_config:
-                self.filter_managers[pair] = FilterManager()
-                self.health[pair] = {
+            for asset in self.assets_config:
+                self.filter_managers[asset] = FilterManager()
+                self.health[asset] = {
                     'status': 'initializing',
                     'last_check': None,
                     'signals_today': 0,
                     'last_signal': None
                 }
+
             app_state['is_running'] = True
-            logger.info("Engine v4.1 initialization complete!")
+            logger.info("Engine v5.0 ready!")
+
         except Exception as e:
-            logger.error(f"Engine initialization failed: {e}")
+            logger.error(f"Engine init failed: {e}")
             raise
 
     async def _keep_alive_ping(self):
@@ -101,196 +113,152 @@ class CloudForexEngine:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get('http://localhost:8000/health', timeout=10) as resp:
-                        logger.debug(f"Keep-alive ping: {resp.status}")
+                        logger.debug(f"Keep-alive: {resp.status}")
                 await asyncio.sleep(300)
             except Exception as e:
-                logger.debug(f"Keep-alive ping failed: {e}")
+                logger.debug(f"Keep-alive failed: {e}")
                 await asyncio.sleep(60)
 
-    async def monitor_pair(self, pair: str):
-        config = self.pairs_config[pair]
-        logger.info(f"Starting monitor for {pair} ({config['source']}) | {config['tf']} candles every {config['check_interval']}s")
-        
+    async def analyze_asset_once(self, asset: str) -> dict:
+        cfg = self.assets_config[asset]
+        start_time = asyncio.get_event_loop().time()
+
+        try:
+            result = await self.mtf_engine.analyze_asset(
+                pair=asset,
+                source=cfg["source"],
+                timeframes=cfg["timeframes"],
+                data_feed=self.data_feed
+            )
+
+            if result is None:
+                self.health[asset]['status'] = 'no_data'
+                self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                return {"asset": asset, "signal": "NO_DATA", "reason": "Failed to fetch or analyze"}
+
+            if result.get("signal") == "HOLD":
+                self.health[asset]['status'] = 'healthy'
+                self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                return {
+                    "asset": asset,
+                    "signal": "HOLD",
+                    "reason": result.get("reason", "No signal"),
+                    "volatility_passed": result.get("volatility_passed", False),
+                    "layers": result.get("layers", {})
+                }
+
+            signal_type = result["signal"]
+            current_price = result["entry_price"]
+            is_early = result.get("is_early", False)
+
+            filter_passed, filter_report = self.filter_managers[asset].validate_signal(
+                df=result.get("secondary_df"),
+                signal_type=signal_type,
+                current_price=current_price,
+                indicators=result.get("secondary_indicators"),
+                pair=asset,
+                is_early=is_early
+            )
+
+            if not filter_passed:
+                reason = filter_report.get('filters', {}).get('cooldown_check', {}).get('reason', 'Filter blocked')
+                for fname, fres in filter_report.get('filters', {}).items():
+                    if not fres.get('passed', True):
+                        logger.info(f"FILTER BLOCK [{asset}]: {fname}: {fres.get('reason', '')}")
+                self.health[asset]['status'] = 'healthy'
+                self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                return {
+                    "asset": asset,
+                    "signal": "HOLD",
+                    "reason": f"Filter blocked: {reason}",
+                    "layers": result.get("layers", {})
+                }
+
+            confidence_boost = filter_report.get('confidence_boost', 1.0)
+            adjusted_confidence = min(result["confidence"] * confidence_boost, 0.99)
+
+            if adjusted_confidence < 0.50:
+                logger.info(f"LOW CONFIDENCE SKIP [{asset}]: {adjusted_confidence:.2%}")
+                self.health[asset]['status'] = 'healthy'
+                self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                return {"asset": asset, "signal": "HOLD", "reason": f"Confidence {adjusted_confidence:.2%} too low"}
+
+            urgency = 'high' if adjusted_confidence > 0.85 else 'normal' if adjusted_confidence > 0.60 else 'low'
+
+            display_name = cfg.get("display_name", asset)
+            alert = SignalAlert(
+                pair=display_name,
+                signal=signal_type,
+                entry_price=result["entry_price"],
+                confidence=adjusted_confidence,
+                timestamp=datetime.utcnow(),
+                reasoning=result["reason"],
+                stop_loss=result["stop_loss"],
+                take_profit=result["take_profit"],
+                urgency=urgency,
+                is_early=is_early,
+                confluence_score=result["confidence"],
+                layers=result.get("layers", {})
+            )
+
+            await self.notification_manager.send_telegram_alert(alert)
+
+            signal_data = {
+                "asset": asset,
+                "display_name": display_name,
+                "signal": signal_type,
+                "entry_price": result["entry_price"],
+                "stop_loss": result["stop_loss"],
+                "take_profit": result["take_profit"],
+                "confidence": adjusted_confidence,
+                "timestamp": datetime.utcnow().isoformat(),
+                "reason": result["reason"],
+                "is_early": is_early,
+                "atr_pct": result.get("atr_pct"),
+                "adx": result.get("adx"),
+                "layers": result.get("layers", {}),
+                "setup_hash": result.get("setup_hash")
+            }
+
+            if redis_client:
+                await redis_client.setex(f"signal:{asset}:current", 3600, json.dumps(signal_data))
+
+            self.health[asset]['signals_today'] += 1
+            self.health[asset]['last_signal'] = signal_data
+            self.health[asset]['status'] = 'healthy'
+            self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+
+            label = "🚨 EARLY" if is_early else "🚀 CONFIRMED"
+            logger.info(
+                f"{label} [{asset}] {signal_type} @ {result['entry_price']:.5f} | "
+                f"SL:{result['stop_loss']:.5f} TP:{result['take_profit']:.5f} | "
+                f"Conf:{adjusted_confidence:.2%}"
+            )
+
+            return signal_data
+
+        except Exception as e:
+            logger.error(f"Error analyzing {asset}: {e}")
+            self.health[asset]['status'] = 'error'
+            self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+            return {"asset": asset, "signal": "ERROR", "reason": str(e)}
+
+    async def monitor_asset(self, asset: str):
+        cfg = self.assets_config[asset]
+        logger.info(f"Monitor started: {asset} ({cfg['source']}) | interval: {cfg['check_interval']}s")
+
         while app_state['is_running']:
-            try:
-                start_time = asyncio.get_event_loop().time()
-                df = await asyncio.wait_for(
-                    self.data_feed.fetch_latest(pair, timeframe=config['tf']),
-                    timeout=20.0
-                )
-                if df is None or df.empty:
-                    logger.warning(f"No data for {pair}")
-                    await asyncio.sleep(10)
-                    continue
-                if len(df) < 200:
-                    logger.warning(f"Insufficient data for {pair}: {len(df)} candles")
-                    await asyncio.sleep(10)
-                    continue
-
-                try:
-                    indicators = self.analyzer.calculate_indicators(df)
-                except Exception as e:
-                    logger.warning(f"Technical analysis failed for {pair}: {e}")
-                    await asyncio.sleep(10)
-                    continue
-
-                current_price = indicators['current_price']
-                smc_signal = indicators.get('smc_suggested_signal', 'HOLD')
-                smc_score = indicators.get('confluence_score', 0.0)
-                rsi = indicators.get('rsi', 50.0)
-                rsi_momentum = indicators.get('rsi_momentum', 0.0)
-                live_reversal = indicators.get('live_reversal')
-                div_type = indicators.get('rsi_divergence', 'NONE')
-                cs_signal = indicators.get('candlestick_signal', 'HOLD')
-                cs_confidence = indicators.get('candlestick_confidence', 0.0)
-                fakeout_detected = indicators.get('fakeout_detected', False)
-                fakeout_direction = indicators.get('fakeout_direction')
-                fakeout_risk = indicators.get('fakeout_risk', 0.0)
-                market_structure = indicators.get('market_structure', 'SIDEWAYS')
-                
-                # FIBONACCI info for logging
-                fib_zones = indicators.get('fib_zones', {})
-                nearest_fib = fib_zones.get('nearest_level', 'N/A') if fib_zones else 'N/A'
-                fib_position = fib_zones.get('position', 50) if fib_zones else 50
-
-                # EARLY WARNING: Setup forming but not confirmed yet
-                if smc_score >= 0.20 and smc_score < 0.60:
-                    if rsi <= 45 and rsi_momentum > 0 and smc_signal == 'BUY':
-                        logger.info(f"⚠️ EARLY WARNING: {pair} BUY setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f}, Fib: {nearest_fib}%)")
-                    elif rsi >= 55 and rsi_momentum < 0 and smc_signal == 'SELL':
-                        logger.info(f"⚠️ EARLY WARNING: {pair} SELL setup forming (score: {smc_score:.2f}, RSI: {rsi:.1f}, Fib: {nearest_fib}%)")
-
-                # Determine if this is an early signal (0.60-0.75) or confirmed (0.75+)
-                is_early = False
-                final_signal = "HOLD"
-                final_confidence = 0.0
-                prediction_source = "CONFLUENCE"
-
-                if smc_signal in ['BUY', 'SELL'] and smc_score >= 0.60:
-                    final_signal = smc_signal
-                    final_confidence = smc_score
-
-                    if smc_score >= 0.60 and smc_score < 0.75:
-                        is_early = True
-                        prediction_source = "CONFLUENCE_EARLY"
-                    else:
-                        is_early = False
-                        prediction_source = "CONFLUENCE_CONFIRMED"
-
-                if final_signal in ['BUY', 'SELL']:
-                    filter_passed, filter_report = self.filter_managers[pair].validate_signal(
-                        df, final_signal, current_price,
-                        indicators=indicators, pair=pair, is_early=is_early
-                    )
-
-                    if filter_passed:
-                        # Check fakeout blocking
-                        if fakeout_detected and fakeout_risk >= 0.40:
-                            should_block, block_reason = self.analyzer.fakeout_detector.should_block_signal(
-                                {"fakeout_detected": fakeout_detected, "fakeout_direction": fakeout_direction,
-                                 "fakeout_risk": fakeout_risk, "trap_type": indicators.get('fakeout_trap_type')},
-                                final_signal
-                            )
-                            if should_block:
-                                logger.info(f"FAKEOUT BLOCK: {pair} {final_signal} blocked. {block_reason}")
-                                self.health[pair]['status'] = 'healthy'
-                                self.health[pair]['last_check'] = asyncio.get_event_loop().time()
-                                elapsed = asyncio.get_event_loop().time() - start_time
-                                sleep_time = max(5, config['check_interval'] - elapsed)
-                                await asyncio.sleep(sleep_time)
-                                continue
-
-                        # Build alert
-                        confidence_boost = filter_report.get('confidence_boost', 1.0)
-                        adjusted_confidence = min(final_confidence * confidence_boost, 0.99)
-
-                        # SKIP: Don't send signals with adjusted confidence below 50%
-                        if adjusted_confidence < 0.50:
-                            logger.info(f"LOW CONFIDENCE SKIP: {pair} {final_signal} raw={final_confidence:.2%} adjusted={adjusted_confidence:.2%}")
-                            self.health[pair]['status'] = 'healthy'
-                            self.health[pair]['last_check'] = asyncio.get_event_loop().time()
-                            elapsed = asyncio.get_event_loop().time() - start_time
-                            sleep_time = max(5, config['check_interval'] - elapsed)
-                            await asyncio.sleep(sleep_time)
-                            continue
-
-                        urgency = 'high' if adjusted_confidence > 0.85 else 'normal' if adjusted_confidence > 0.60 else 'low'
-                        if is_early:
-                            urgency = 'normal'
-
-                        alert = SignalAlert(
-                            pair=pair,
-                            signal=final_signal,
-                            price=current_price,
-                            confidence=adjusted_confidence,
-                            timestamp=datetime.utcnow(),
-                            reasoning=indicators.get('smc_reasoning', f'{prediction_source} Pattern Recognition'),
-                            target=indicators.get('suggested_take_profit'),
-                            stop_loss=indicators.get('suggested_stop_loss'),
-                            urgency=urgency,
-                            is_early=is_early,
-                            confluence_score=smc_score
-                        )
-                        await self.notification_manager.send_telegram_alert(alert)
-
-                        signal_data = {
-                            'pair': pair,
-                            'signal': final_signal,
-                            'price': current_price,
-                            'confidence': adjusted_confidence,
-                            'timestamp': datetime.utcnow().isoformat(),
-                            'target': indicators.get('suggested_take_profit'),
-                            'stop_loss': indicators.get('suggested_stop_loss'),
-                            'reasoning': indicators.get('smc_reasoning', ''),
-                            'source': prediction_source,
-                            'is_early': is_early,
-                            'confluence_score': smc_score,
-                            'market_structure': market_structure,
-                            'fib_zone': nearest_fib,
-                            'fib_position': fib_position,
-                            'live_reversal': live_reversal,
-                            'rsi_divergence': div_type,
-                            'candlestick_signal': cs_signal,
-                            'candlestick_confidence': cs_confidence,
-                            'fakeout_detected': fakeout_detected,
-                            'fakeout_direction': fakeout_direction,
-                            'fakeout_risk': fakeout_risk
-                        }
-                        if redis_client:
-                            await redis_client.setex(f"signal:{pair}:current", 3600, json.dumps(signal_data))
-
-                        self.last_sent_signal[pair] = final_signal
-                        self.health[pair]['signals_today'] += 1
-                        self.health[pair]['last_signal'] = signal_data
-                        label = "🚨 EARLY" if is_early else "🚀 CONFIRMED"
-                        logger.info(f"{label} SIGNAL SENT: {pair} {final_signal} @ {current_price:.2f} (conf: {adjusted_confidence:.2%}) [Source: {prediction_source}] [Fib: {nearest_fib}%]")
-                    else:
-                        reason = filter_report.get('filters', {}).get('cooldown_check', {}).get('reason', 'Filter blocked')
-                        # Log which filter blocked it
-                        for filter_name, filter_result in filter_report.get('filters', {}).items():
-                            if not filter_result.get('passed', True):
-                                logger.info(f"FILTER BLOCK: {pair} {final_signal} — {filter_name}: {filter_result.get('reason', 'unknown')}")
-                else:
-                    logger.debug(f"FILTER DEBUG: {pair} no valid signal. SMC: {smc_signal}({smc_score:.2f}) | CS: {cs_signal}({cs_confidence:.2f}) | Live: {live_reversal} | Div: {div_type} | Fib: {nearest_fib}%")
-
-                self.health[pair]['status'] = 'healthy'
-                self.health[pair]['last_check'] = asyncio.get_event_loop().time()
-                elapsed = asyncio.get_event_loop().time() - start_time
-                sleep_time = max(5, config['check_interval'] - elapsed)
-                await asyncio.sleep(sleep_time)
-
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout fetching {pair}. Retrying in 15s...")
-                await asyncio.sleep(15)
-            except Exception as e:
-                logger.error(f"Error in {pair} loop: {e}")
-                await asyncio.sleep(10)
+            start = asyncio.get_event_loop().time()
+            await self.analyze_asset_once(asset)
+            elapsed = asyncio.get_event_loop().time() - start
+            sleep_time = max(5, cfg['check_interval'] - elapsed)
+            await asyncio.sleep(sleep_time)
 
     async def start(self):
         await self.initialize()
         asyncio.create_task(self._keep_alive_ping())
-        for pair in self.pairs_config:
-            self.tasks[pair] = asyncio.create_task(self.monitor_pair(pair))
+        for asset in self.assets_config:
+            self.tasks[asset] = asyncio.create_task(self.monitor_asset(asset))
             await asyncio.sleep(2)
 
     async def stop(self):
@@ -301,7 +269,7 @@ class CloudForexEngine:
             await self.notification_manager.close()
         if redis_client:
             await redis_client.close()
-        logger.info("Engine v4.1 stopped")
+        logger.info("Engine v5.0 stopped")
 
 
 @asynccontextmanager
@@ -315,8 +283,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Crypto Signal Bot",
-    description="BTCUSD pattern prediction with Telegram alerts — v4.1 Fibonacci + Trend Filter",
-    version="4.1",
+    description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD",
+    version="5.0",
     lifespan=lifespan
 )
 
@@ -330,11 +298,13 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
+    engine = app_state.get('engine')
+    assets = list(engine.assets_config.keys()) if engine else []
     return {
         "status": "running" if app_state['is_running'] else "down",
-        "pairs": list(app_state.get('engine', {}).pairs_config.keys() if app_state.get('engine') else []),
-        "version": "4.1",
-        "mode": "5m candles — Pure Price Action + Fibonacci + Trend Filter (No LSTM)"
+        "assets": assets,
+        "version": "5.0",
+        "mode": "Multi-Timeframe | Volatility Filter | Duplicate Prevention | Kraken Fallback"
     }
 
 
@@ -345,25 +315,45 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "4.1",
-        "pairs": {
-            pair: {
+        "version": "5.0",
+        "assets": {
+            asset: {
                 "status": info['status'],
                 "signals_today": info['signals_today'],
                 "last_signal": info.get('last_signal')
             }
-            for pair, info in engine.health.items()
+            for asset, info in engine.health.items()
         }
     }
 
 
-@app.get("/api/signal/{pair}")
-async def get_signal(pair: str):
+@app.get("/analyze")
+async def trigger_analysis():
+    engine = app_state.get('engine')
+    if not engine or not app_state['is_running']:
+        raise HTTPException(status_code=503, detail="Engine not running")
+
+    results = {}
+    for asset in engine.assets_config:
+        try:
+            result = await engine.analyze_asset_once(asset)
+            results[asset] = result
+        except Exception as e:
+            results[asset] = {"asset": asset, "signal": "ERROR", "reason": str(e)}
+
+    return {
+        "triggered_at": datetime.utcnow().isoformat(),
+        "results": results
+    }
+
+
+@app.get("/api/signal/{asset}")
+async def get_signal(asset: str):
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available")
-    data = await redis_client.get(f"signal:{pair.upper()}:current")
+    data = await redis_client.get(f"signal:{asset.upper()}:current")
     if not data:
-        raise HTTPException(status_code=404, detail=f"No active signal for {pair}")
+        raise HTTPException(status_code=404, detail=f"No active signal for {asset}")
     return json.loads(data)
 
 
@@ -372,10 +362,10 @@ async def get_all_signals():
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available")
     signals = {}
-    for pair in ["BTCUSD"]:
-        data = await redis_client.get(f"signal:{pair}:current")
+    for asset in ["BTCUSD", "frxEURUSD"]:
+        data = await redis_client.get(f"signal:{asset}:current")
         if data:
-            signals[pair] = json.loads(data)
+            signals[asset] = json.loads(data)
     return signals
 
 
@@ -389,4 +379,3 @@ if __name__ == "__main__":
         workers=1,
         loop="asyncio"
     )
-

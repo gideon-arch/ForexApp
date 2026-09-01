@@ -1,5 +1,5 @@
 # core/notifications.py
-# Telegram notification system with urgency levels
+# Telegram notification system — multi-asset, exact entry/TP/SL
 
 import os
 import asyncio
@@ -12,51 +12,50 @@ logger = logging.getLogger(__name__)
 
 
 class SignalAlert:
-    """Represents a trading signal alert"""
-
-    def __init__(self, pair: str, signal: str, price: float, confidence: float,
-                 timestamp: datetime, reasoning: str, target: Optional[float] = None,
-                 stop_loss: Optional[float] = None, urgency: str = "normal",
-                 is_early: bool = False, confluence_score: float = 0.0):
+    def __init__(self, pair: str, signal: str, entry_price: float, confidence: float,
+                 timestamp: datetime, reasoning: str, stop_loss: float,
+                 take_profit: float, urgency: str = "normal",
+                 is_early: bool = False, confluence_score: float = 0.0,
+                 layers: Optional[Dict] = None):
         self.pair = pair
         self.signal = signal
-        self.price = price
+        self.entry_price = entry_price
         self.confidence = confidence
         self.timestamp = timestamp
         self.reasoning = reasoning
-        self.target = target
         self.stop_loss = stop_loss
+        self.take_profit = take_profit
         self.urgency = urgency
         self.is_early = is_early
         self.confluence_score = confluence_score
+        self.layers = layers or {}
 
     def to_dict(self) -> Dict:
         return {
             "pair": self.pair,
             "signal": self.signal,
-            "price": self.price,
+            "entry_price": self.entry_price,
             "confidence": self.confidence,
             "timestamp": self.timestamp.isoformat(),
             "reasoning": self.reasoning,
-            "target": self.target,
             "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
             "urgency": self.urgency,
             "is_early": self.is_early,
-            "confluence_score": self.confluence_score
+            "confluence_score": self.confluence_score,
+            "layers": self.layers
         }
 
 
 class NotificationManager:
-    """Manages Telegram alerts for trading signals"""
-
     def __init__(self):
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         self.enabled = bool(self.bot_token and self.chat_id)
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_alert_time: Optional[datetime] = None
-        self.min_alert_interval = 30  # seconds between alerts
-        logger.info(f"NotificationManager initialized | Enabled: {self.enabled}")
+        self.min_alert_interval = 15
+        logger.info(f"NotificationManager | Enabled: {self.enabled}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -65,16 +64,15 @@ class NotificationManager:
 
     async def send_test_message(self, message: str) -> bool:
         if not self.enabled:
-            logger.warning("Telegram not configured — skipping test message")
+            logger.warning("Telegram not configured")
             return False
         return await self._send_telegram_message(message)
 
     async def send_telegram_alert(self, alert: SignalAlert) -> bool:
         if not self.enabled:
-            logger.warning("Telegram not configured — alert not sent")
+            logger.warning("Telegram not configured")
             return False
 
-        # Rate limiting
         if self.last_alert_time:
             elapsed = (datetime.utcnow() - self.last_alert_time).total_seconds()
             if elapsed < self.min_alert_interval:
@@ -87,52 +85,42 @@ class NotificationManager:
             self.last_alert_time = datetime.utcnow()
         return success
 
-    async def send_early_warning(self, pair: str, signal: str, price: float,
-                                  confluence_score: float, reasoning: str) -> bool:
-        if not self.enabled:
-            return False
-
-        alert = SignalAlert(
-            pair=pair,
-            signal=signal,
-            price=price,
-            confidence=confluence_score,
-            timestamp=datetime.utcnow(),
-            reasoning=reasoning,
-            urgency="low",
-            is_early=True,
-            confluence_score=confluence_score
-        )
-        return await self.send_telegram_alert(alert)
-
     def _format_alert_message(self, alert: SignalAlert) -> str:
-        emoji_signal = "🟢 BUY" if alert.signal == "BUY" else "🔴 SELL" if alert.signal == "SELL" else "⚪ HOLD"
+        emoji_signal = "🟢 BUY" if alert.signal == "BUY" else "🔴 SELL"
         emoji_urgency = "🔥" if alert.urgency == "high" else "⚡" if alert.urgency == "normal" else "📡"
         early_label = " [EARLY]" if alert.is_early else ""
 
+        # Asset-specific emoji
+        asset_emoji = "₿" if "BTC" in alert.pair.upper() else "📊"
+
         lines = [
-            f"{emoji_urgency} AI CRYPTO SIGNAL{early_label}",
+            f"{emoji_urgency} {asset_emoji} AI SIGNAL{early_label}",
             f"━━━━━━━━━━━━━━━━━━━━━━━",
-            f"📊 Pair: {alert.pair}",
+            f"📊 Asset: {alert.pair}",
             f"{emoji_signal}",
-            f"💰 Price: {alert.price:,.2f}",
-            f"🎯 Confidence: {alert.confidence*100:.1f}%",
-            f"📈 Confluence Score: {alert.confluence_score:.2f}",
+            f"",
+            f"🎯 ENTRY:  {alert.entry_price:,.2f}",
+            f"🛑 SL:     {alert.stop_loss:,.2f}",
+            f"💰 TP:     {alert.take_profit:,.2f}",
+            f"",
+            f"Confidence: {alert.confidence * 100:.1f}%",
+            f"Confluence: {alert.confluence_score:.2f}",
             f"⏰ Time: {alert.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        ]
-
-        if alert.target:
-            lines.append(f"🎯 Target: {alert.target:,.2f}")
-        if alert.stop_loss:
-            lines.append(f"🛑 Stop Loss: {alert.stop_loss:,.2f}")
-
-        lines.extend([
             f"━━━━━━━━━━━━━━━━━━━━━━━",
             f"🧠 Analysis:",
             f"{alert.reasoning}",
-            f"━━━━━━━━━━━━━━━━━━━━━━━",
-            f"🤖 AI Crypto Bot v4.1 | Fibonacci + Trend Filter | Pure Price Action"
-        ])
+        ]
+
+        if alert.layers:
+            lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"📐 Layer Check:")
+            for layer, data in alert.layers.items():
+                sig = data.get("signal", "HOLD")
+                trend = data.get("trend", "?")
+                lines.append(f"  {layer}: {sig} ({trend})")
+
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🤖 AI Bot v5.0 | Multi-Timeframe | Volatility Filter")
 
         return "\n".join(lines)
 
@@ -152,17 +140,17 @@ class NotificationManager:
             session = await self._get_session()
             async with session.post(url, json=payload, timeout=10) as response:
                 if response.status == 200:
-                    logger.info("Telegram message sent successfully")
+                    logger.info("Telegram sent successfully")
                     return True
                 else:
                     text = await response.text()
                     logger.error(f"Telegram API error {response.status}: {text[:200]}")
                     return False
         except Exception as e:
-            logger.error(f"Failed to send Telegram message: {e}")
+            logger.error(f"Failed to send Telegram: {e}")
             return False
 
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
-            logger.info("NotificationManager session closed")
+            logger.info("NotificationManager closed")

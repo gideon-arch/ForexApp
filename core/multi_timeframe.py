@@ -1,6 +1,7 @@
 # core/multi_timeframe.py
-# Multi-timeframe alignment engine — ALL 3 layers must agree
-# BTCUSD: 15m → 5m → 1m  |  V10(1s): 5m → 1m → 10s
+# Multi-timeframe alignment engine
+# v5.1: Morning-bird boost + 2-layer fallback + bug fix (primary_signal NameError)
+# BTCUSD: 15m -> 5m -> 1m  |  V10(1s): 5m -> 1m -> 10s
 
 import os
 import hashlib
@@ -74,7 +75,13 @@ class MultiTimeframeEngine:
     - Primary (direction): confirms overall trend/bias
     - Secondary (setup): validates trading setup
     - Entry (timing): precise entry moment
-    ALL 3 must align + volatility filter + confidence threshold.
+
+    v5.1 changes:
+    - Morning-bird window: temporarily relaxed thresholds to catch early session moves
+    - 2-layer fallback: primary + secondary agreement can fire without entry
+      confirmation (with confidence penalty) instead of dying at the entry layer
+    - Fixed NameError bug: 'primary_signal' was never defined (would crash on
+      a full 3-layer alignment)
     """
 
     def __init__(self):
@@ -83,14 +90,42 @@ class MultiTimeframeEngine:
             cooldown_minutes=int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "10")),
             price_tolerance_pct=0.005
         )
-        self.min_confidence = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.65"))
-        self.min_adx = float(os.getenv("MIN_ADX", "20"))
-        self.min_atr_pct = float(os.getenv("MIN_ATR_PCT", "0.03"))
+
+        # ===== STANDARD THRESHOLDS (relaxed vs v5.0 defaults) =====
+        self.min_confidence = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.60"))
+        self.min_adx = float(os.getenv("MIN_ADX", "18"))
+        self.min_atr_pct = float(os.getenv("MIN_ATR_PCT", "0.02"))
+
+        # ===== 2-LAYER FALLBACK =====
+        # If entry layer won't confirm but direction + setup agree strongly,
+        # fire anyway with a confidence penalty instead of going HOLD.
+        self.allow_two_layer = os.getenv("ALLOW_TWO_LAYER_FALLBACK", "true").lower() == "true"
+        self.two_layer_min_score = float(os.getenv("TWO_LAYER_MIN_SCORE", "0.45"))
+
+        # ===== MORNING-BIRD BOOST =====
+        # Render servers run on UTC. Morning window defaults to 06:00-10:00 UTC
+        # = 07:00-11:00 for UTC+1. Adjust via .env to match YOUR morning.
+        self.morning_start_utc = int(os.getenv("MORNING_BOOST_START_UTC", "6"))
+        self.morning_end_utc = int(os.getenv("MORNING_BOOST_END_UTC", "10"))
+        self.morning_min_confidence = float(os.getenv("MORNING_MIN_CONFIDENCE", "0.55"))
+        self.morning_min_adx = float(os.getenv("MORNING_MIN_ADX", "15"))
+        self.morning_min_atr_pct = float(os.getenv("MORNING_MIN_ATR_PCT", "0.015"))
+        self.morning_two_layer_min_score = float(os.getenv("MORNING_TWO_LAYER_MIN_SCORE", "0.35"))
 
         logger.info(
-            f"MultiTimeframeEngine | Min confidence: {self.min_confidence} | "
-            f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}%"
+            f"MultiTimeframeEngine v5.1 | Min confidence: {self.min_confidence} | "
+            f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
+            f"2-layer fallback: {self.allow_two_layer} (score>={self.two_layer_min_score}) | "
+            f"Morning boost: {self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC"
         )
+
+    def _morning_boost_active(self) -> bool:
+        """True during the configured morning window (UTC)."""
+        hour = datetime.utcnow().hour
+        if self.morning_start_utc <= self.morning_end_utc:
+            return self.morning_start_utc <= hour < self.morning_end_utc
+        # Window wraps midnight (e.g. 22 -> 6)
+        return hour >= self.morning_start_utc or hour < self.morning_end_utc
 
     async def analyze_asset(self, pair: str, source: str, timeframes: dict,
                             data_feed) -> Optional[Dict]:
@@ -102,6 +137,13 @@ class MultiTimeframeEngine:
         }
         """
         self.signal_tracker.clear_old()
+        morning = self._morning_boost_active()
+
+        # Effective thresholds (morning window uses relaxed values)
+        eff_min_conf = self.morning_min_confidence if morning else self.min_confidence
+        eff_min_adx = self.morning_min_adx if morning else self.min_adx
+        eff_min_atr = self.morning_min_atr_pct if morning else self.min_atr_pct
+        eff_two_layer_score = self.morning_two_layer_min_score if morning else self.two_layer_min_score
 
         # Fetch all 3 timeframes
         frames = {}
@@ -148,13 +190,14 @@ class MultiTimeframeEngine:
         atr_pct = (secondary.get("atr", 0) / current_price) * 100
         adx = secondary.get("adx", 0)
 
-        if atr_pct < self.min_atr_pct or adx < self.min_adx:
+        if atr_pct < eff_min_atr or adx < eff_min_adx:
             reason = []
-            if atr_pct < self.min_atr_pct:
-                reason.append(f"ATR {atr_pct:.3f}% < {self.min_atr_pct}%")
-            if adx < self.min_adx:
-                reason.append(f"ADX {adx:.1f} < {self.min_adx}")
-            logger.info(f"{pair} VOLATILITY BLOCK: {' | '.join(reason)}")
+            if atr_pct < eff_min_atr:
+                reason.append(f"ATR {atr_pct:.3f}% < {eff_min_atr}%")
+            if adx < eff_min_adx:
+                reason.append(f"ADX {adx:.1f} < {eff_min_adx}")
+            tag = "MORNING " if morning else ""
+            logger.info(f"{pair} {tag}VOLATILITY BLOCK: {' | '.join(reason)}")
             return {
                 "pair": pair, "signal": "HOLD",
                 "reason": f"Volatility filter: {' | '.join(reason)}",
@@ -166,6 +209,7 @@ class MultiTimeframeEngine:
 
         # ===== DIRECTION CHECK (Primary) =====
         primary_trend = primary.get("market_structure", "SIDEWAYS")
+        primary_signal = primary.get("smc_suggested_signal", "HOLD")  # FIX: was never defined (NameError on full alignment)
         trend_direction = None
         if primary_trend in ["BULLISH", "BULLISH_PULLBACK", "WEAK_BULLISH"]:
             trend_direction = "BUY"
@@ -232,15 +276,29 @@ class MultiTimeframeEngine:
                 entry_confirms = True
                 entry_confidence = 0.40
 
+        # ===== v5.1: 2-LAYER FALLBACK =====
+        # Direction + setup agree but entry layer is quiet (common on fast
+        # morning moves — the 1m layer lags the impulse). Fire with a penalty
+        # instead of missing the move entirely.
+        two_layer_mode = False
         if not entry_confirms:
-            return {
-                "pair": pair, "signal": "HOLD",
-                "reason": "Entry timeframe not confirming",
-                "volatility_passed": True,
-                "secondary_indicators": secondary,
-                "secondary_df": frames["secondary"],
-                "layers": self._summarize_layers(analyses)
-            }
+            if (self.allow_two_layer
+                    and secondary_score >= eff_two_layer_score
+                    and secondary.get("fakeout_risk", 0) < 0.40):
+                entry_confirms = True
+                entry_confidence = 0.25
+                two_layer_mode = True
+                logger.info(f"{pair} 2-LAYER MODE: entry layer quiet, direction+setup agree "
+                            f"(score {secondary_score:.2f}) — firing with penalty")
+            else:
+                return {
+                    "pair": pair, "signal": "HOLD",
+                    "reason": "Entry timeframe not confirming",
+                    "volatility_passed": True,
+                    "secondary_indicators": secondary,
+                    "secondary_df": frames["secondary"],
+                    "layers": self._summarize_layers(analyses)
+                }
 
         # ===== COMBINED CONFIDENCE =====
         primary_conf = primary.get("trend_strength", 0.5)
@@ -254,13 +312,17 @@ class MultiTimeframeEngine:
         if primary_signal == secondary_signal == entry_signal == trend_direction:
             combined = min(combined * 1.15, 0.99)
 
+        if two_layer_mode:
+            combined *= 0.85  # penalty for missing entry-layer confirmation
+
         if secondary.get("fakeout_detected") and secondary.get("fakeout_risk", 0) > 0.3:
             combined *= 0.7
 
-        if combined < self.min_confidence:
+        if combined < eff_min_conf:
             return {
                 "pair": pair, "signal": "HOLD",
-                "reason": f"Confidence {combined:.2f} < min {self.min_confidence}",
+                "reason": f"Confidence {combined:.2f} < min {eff_min_conf}"
+                            + (" (morning boost)" if morning else ""),
                 "volatility_passed": True,
                 "secondary_indicators": secondary,
                 "secondary_df": frames["secondary"],
@@ -312,7 +374,8 @@ class MultiTimeframeEngine:
             "entry_price": round(entry_price, 2),
             "stop_loss": round(stop_loss, 2),
             "take_profit": round(take_profit, 2),
-            "reason": self._build_reason(analyses, trend_direction, combined),
+            "reason": self._build_reason(analyses, trend_direction, combined,
+                                         two_layer_mode=two_layer_mode, morning=morning),
             "volatility_passed": True,
             "primary_trend": primary_trend,
             "secondary_score": round(secondary_score, 3),
@@ -322,7 +385,9 @@ class MultiTimeframeEngine:
             "secondary_indicators": secondary,
             "secondary_df": frames["secondary"],
             "layers": self._summarize_layers(analyses),
-            "is_early": combined < 0.80,
+            "is_early": combined < 0.80 or two_layer_mode,
+            "two_layer_mode": two_layer_mode,
+            "morning_boost": morning,
             "setup_hash": setup_hash
         }
 
@@ -337,16 +402,21 @@ class MultiTimeframeEngine:
             for layer, a in analyses.items()
         }
 
-    def _build_reason(self, analyses: dict, signal: str, confidence: float) -> str:
+    def _build_reason(self, analyses: dict, signal: str, confidence: float,
+                      two_layer_mode: bool = False, morning: bool = False) -> str:
         p = analyses["primary"]
         s = analyses["secondary"]
         e = analyses["entry"]
 
-        parts = [f"3-LAYER ALIGNMENT ({signal}) | Confidence: {confidence * 100:.1f}%"]
+        mode = "2-LAYER" if two_layer_mode else "3-LAYER"
+        tag = "🌅 MORNING BOOST | " if morning else ""
+        parts = [f"{tag}{mode} ALIGNMENT ({signal}) | Confidence: {confidence * 100:.1f}%"]
         parts.append(f"Direction: {p.get('market_structure')} (strength: {p.get('trend_strength', 0):.2f})")
         parts.append(f"Setup: {s.get('smc_reasoning', 'N/A')[:80]}")
 
-        if e.get("live_reversal"):
+        if two_layer_mode:
+            parts.append("Entry layer quiet — fired on direction+setup (penalty applied)")
+        elif e.get("live_reversal"):
             parts.append(f"Entry: {e.get('live_reversal')}")
         elif e.get("candlestick_signal") != "HOLD":
             parts.append(f"Entry pattern: {e.get('candlestick_signal')}")

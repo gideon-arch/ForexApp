@@ -1,7 +1,8 @@
-# main.py - AI Crypto Signal Bot v5.0
+# main.py - AI Crypto Signal Bot v5.1
 # Multi-Asset | Multi-Timeframe | /analyze endpoint for cron-job.org
 # BTCUSD (Kraken): 15m -> 5m -> 1m
 # EURUSD (Deriv -> Kraken fallback): 15m -> 5m -> 1m
+# v5.1: 8h Telegram summary heartbeat + morning-bird faster checks + per-cycle log heartbeat
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -72,22 +73,40 @@ class CloudForexEngine:
         self.filter_managers = {}
         self.mtf_engine = MultiTimeframeEngine()
 
-        logger.info("CloudForexEngine v5.0 | BTCUSD (Kraken) + EURUSD (Deriv/Kraken fallback)")
+        # ===== MORNING-BIRD: faster checks during the morning window =====
+        # Same UTC window as the engine's boost — must match .env values.
+        self.morning_start_utc = int(os.getenv("MORNING_BOOST_START_UTC", "6"))
+        self.morning_end_utc = int(os.getenv("MORNING_BOOST_END_UTC", "10"))
+        self.morning_check_interval = int(os.getenv("MORNING_CHECK_INTERVAL", "180"))
+
+        # ===== Summary heartbeat interval (hours) =====
+        self.summary_interval_hours = float(os.getenv("SUMMARY_INTERVAL_HOURS", "8"))
+
+        logger.info("CloudForexEngine v5.1 | BTCUSD (Kraken) + EURUSD (Deriv/Kraken fallback)")
+
+    def _morning_active(self) -> bool:
+        hour = datetime.utcnow().hour
+        if self.morning_start_utc <= self.morning_end_utc:
+            return self.morning_start_utc <= hour < self.morning_end_utc
+        return hour >= self.morning_start_utc or hour < self.morning_end_utc
 
     async def initialize(self):
-        logger.info("Initializing Engine v5.0...")
+        logger.info("Initializing Engine v5.1...")
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
 
             await self.notification_manager.send_test_message(
-                "🤖 AI Crypto Bot v5.0 is ONLINE!\n"
+                "🤖 AI Crypto Bot v5.1 is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Assets: BTCUSD (Kraken) + EURUSD (Deriv/Kraken)\n"
                 "📐 15m → 5m → 1m for both\n"
                 "🎯 Exact Entry + TP + SL\n"
-                "🔄 Kraken fallback active for EURUSD\n"
-                "⚙️ Version: 5.0"
+                "🌅 Morning-bird boost active (faster checks + relaxed gates)\n"
+                "💓 Status summary every "
+                f"{self.summary_interval_hours:g}h\n"
+                "🆕 v5.1: 2-layer fallback + bug fixes\n"
+                "⚙️ Version: 5.1"
             )
             logger.info("Startup message sent")
 
@@ -97,11 +116,12 @@ class CloudForexEngine:
                     'status': 'initializing',
                     'last_check': None,
                     'signals_today': 0,
-                    'last_signal': None
+                    'last_signal': None,
+                    'last_hold_reason': None
                 }
 
             app_state['is_running'] = True
-            logger.info("Engine v5.0 ready!")
+            logger.info("Engine v5.1 ready!")
 
         except Exception as e:
             logger.error(f"Engine init failed: {e}")
@@ -119,6 +139,56 @@ class CloudForexEngine:
                 logger.debug(f"Keep-alive failed: {e}")
                 await asyncio.sleep(60)
 
+    # ===== v5.1: SUMMARY HEARTBEAT (Telegram, every N hours) =====
+    async def _summary_heartbeat_loop(self):
+        """Sends a status summary to Telegram every SUMMARY_INTERVAL_HOURS."""
+        await asyncio.sleep(120)  # first summary ~2 min after startup msg
+        while app_state['is_running']:
+            try:
+                await self._send_summary()
+            except Exception as e:
+                logger.error(f"Summary heartbeat error: {e}")
+            await asyncio.sleep(self.summary_interval_hours * 3600)
+
+    async def _send_summary(self):
+        now = datetime.utcnow()
+        morning = self._morning_active()
+        lines = [
+            f"💓 BOT STATUS — {now.strftime('%Y-%m-%d %H:%M UTC')}",
+            "━━━━━━━━━━━━━━━━━━━",
+        ]
+        for asset, info in self.health.items():
+            display = self.assets_config[asset].get("display_name", asset)
+            status_emoji = "🟢" if info['status'] == 'healthy' else "🟡" if info['status'] == 'initializing' else "🔴"
+            lines.append(f"{status_emoji} {display}: {info['status']} | Signals today: {info['signals_today']}")
+
+            last_sig = info.get('last_signal')
+            if last_sig:
+                lines.append(
+                    f"   Last signal: {last_sig['signal']} @ {last_sig['entry_price']:,.5f} "
+                    f"({last_sig['timestamp'][11:16]} UTC)"
+                )
+            else:
+                last_hold = info.get('last_hold_reason')
+                if last_hold:
+                    lines.append(f"   Watching: HOLD ({last_hold[:60]})")
+                else:
+                    lines.append("   Watching: no data yet")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🌅 Morning boost: {'ACTIVE' if morning else 'off'} "
+                     f"({self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC)")
+        lines.append(f"⏱️ Check cycle: {self._current_check_interval()}s | Summary every {self.summary_interval_hours:g}h")
+        lines.append("🤖 AI Bot v5.1")
+
+        await self.notification_manager.send_test_message("\n".join(lines))
+        logger.info("Summary heartbeat sent")
+
+    def _current_check_interval(self) -> int:
+        if self._morning_active():
+            return self.morning_check_interval
+        return 300
+
     async def analyze_asset_once(self, asset: str) -> dict:
         cfg = self.assets_config[asset]
         start_time = asyncio.get_event_loop().time()
@@ -134,11 +204,15 @@ class CloudForexEngine:
             if result is None:
                 self.health[asset]['status'] = 'no_data'
                 self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                logger.info(f"HEARTBEAT [{asset}] cycle complete | NO_DATA (fetch failed)")
                 return {"asset": asset, "signal": "NO_DATA", "reason": "Failed to fetch or analyze"}
 
             if result.get("signal") == "HOLD":
                 self.health[asset]['status'] = 'healthy'
                 self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                self.health[asset]['last_hold_reason'] = result.get("reason", "No signal")
+                # v5.1: per-cycle log heartbeat — proves the loop is alive in Render logs
+                logger.info(f"HEARTBEAT [{asset}] cycle complete | HOLD: {result.get('reason', 'No signal')}")
                 return {
                     "asset": asset,
                     "signal": "HOLD",
@@ -167,6 +241,8 @@ class CloudForexEngine:
                         logger.info(f"FILTER BLOCK [{asset}]: {fname}: {fres.get('reason', '')}")
                 self.health[asset]['status'] = 'healthy'
                 self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                self.health[asset]['last_hold_reason'] = f"Filter: {reason}"
+                logger.info(f"HEARTBEAT [{asset}] cycle complete | HOLD (filter): {reason}")
                 return {
                     "asset": asset,
                     "signal": "HOLD",
@@ -181,6 +257,8 @@ class CloudForexEngine:
                 logger.info(f"LOW CONFIDENCE SKIP [{asset}]: {adjusted_confidence:.2%}")
                 self.health[asset]['status'] = 'healthy'
                 self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                self.health[asset]['last_hold_reason'] = f"Low confidence {adjusted_confidence:.2%}"
+                logger.info(f"HEARTBEAT [{asset}] cycle complete | HOLD (low confidence)")
                 return {"asset": asset, "signal": "HOLD", "reason": f"Confidence {adjusted_confidence:.2%} too low"}
 
             urgency = 'high' if adjusted_confidence > 0.85 else 'normal' if adjusted_confidence > 0.60 else 'low'
@@ -214,6 +292,8 @@ class CloudForexEngine:
                 "timestamp": datetime.utcnow().isoformat(),
                 "reason": result["reason"],
                 "is_early": is_early,
+                "two_layer_mode": result.get("two_layer_mode", False),
+                "morning_boost": result.get("morning_boost", False),
                 "atr_pct": result.get("atr_pct"),
                 "adx": result.get("adx"),
                 "layers": result.get("layers", {}),
@@ -229,8 +309,10 @@ class CloudForexEngine:
             self.health[asset]['last_check'] = asyncio.get_event_loop().time()
 
             label = "🚨 EARLY" if is_early else "🚀 CONFIRMED"
+            mode_tag = " [2-LAYER]" if result.get("two_layer_mode") else ""
+            morning_tag = " 🌅" if result.get("morning_boost") else ""
             logger.info(
-                f"{label} [{asset}] {signal_type} @ {result['entry_price']:.5f} | "
+                f"{label}{mode_tag}{morning_tag} [{asset}] {signal_type} @ {result['entry_price']:.5f} | "
                 f"SL:{result['stop_loss']:.5f} TP:{result['take_profit']:.5f} | "
                 f"Conf:{adjusted_confidence:.2%}"
             )
@@ -251,12 +333,15 @@ class CloudForexEngine:
             start = asyncio.get_event_loop().time()
             await self.analyze_asset_once(asset)
             elapsed = asyncio.get_event_loop().time() - start
-            sleep_time = max(5, cfg['check_interval'] - elapsed)
+            # v5.1: morning-bird — check every 3 min in the morning window instead of 5
+            effective_interval = self._current_check_interval()
+            sleep_time = max(5, effective_interval - elapsed)
             await asyncio.sleep(sleep_time)
 
     async def start(self):
         await self.initialize()
         asyncio.create_task(self._keep_alive_ping())
+        asyncio.create_task(self._summary_heartbeat_loop())  # v5.1
         for asset in self.assets_config:
             self.tasks[asset] = asyncio.create_task(self.monitor_asset(asset))
             await asyncio.sleep(2)
@@ -269,7 +354,7 @@ class CloudForexEngine:
             await self.notification_manager.close()
         if redis_client:
             await redis_client.close()
-        logger.info("Engine v5.0 stopped")
+        logger.info("Engine v5.1 stopped")
 
 
 @asynccontextmanager
@@ -284,7 +369,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD",
-    version="5.0",
+    version="5.1",
     lifespan=lifespan
 )
 
@@ -303,8 +388,8 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "assets": assets,
-        "version": "5.0",
-        "mode": "Multi-Timeframe | Volatility Filter | Duplicate Prevention | Kraken Fallback"
+        "version": "5.1",
+        "mode": "Multi-Timeframe | Morning Boost | 2-Layer Fallback | Volatility Filter"
     }
 
 
@@ -315,7 +400,9 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "5.0",
+        "version": "5.1",
+        "morning_boost_active": engine._morning_active(),
+        "check_interval_seconds": engine._current_check_interval(),
         "assets": {
             asset: {
                 "status": info['status'],

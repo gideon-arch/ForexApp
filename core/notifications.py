@@ -1,5 +1,8 @@
 # core/notifications.py
 # Telegram notification system — multi-asset, exact entry/TP/SL
+# v5.3: Removed parse_mode="HTML" (was crashing on '<' in hold reasons, e.g.
+#       "Confidence 0.58 < min 0.60" -> Telegram 400 "can't parse entities").
+#       All messages are plain text + emojis, so no formatting is lost.
 
 import os
 import asyncio
@@ -55,7 +58,7 @@ class NotificationManager:
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_alert_time: Optional[datetime] = None
         self.min_alert_interval = 15
-        logger.info(f"NotificationManager | Enabled: {self.enabled}")
+        logger.info(f"NotificationManager v5.3 | Enabled: {self.enabled}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -103,7 +106,7 @@ class NotificationManager:
             f"🛑 SL:     {alert.stop_loss:,.2f}",
             f"💰 TP:     {alert.take_profit:,.2f}",
             f"",
-            f"Confidence: {alert.confidence * 100:.1f}%",
+            f"Confidence: {min(alert.confidence, 1.0) * 100:.1f}%",
             f"Confluence: {alert.confluence_score:.2f}",
             f"⏰ Time: {alert.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
             f"━━━━━━━━━━━━━━━━━━━━━━━",
@@ -120,7 +123,7 @@ class NotificationManager:
                 lines.append(f"  {layer}: {sig} ({trend})")
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"🤖 AI Bot v5.0 | Multi-Timeframe | Volatility Filter")
+        lines.append(f"🤖 AI Bot v5.3 | Multi-Timeframe | Morning Boost")
 
         return "\n".join(lines)
 
@@ -129,10 +132,11 @@ class NotificationManager:
             return False
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        # v5.3: NO parse_mode — plain text. HTML mode crashed on '<' characters
+        # in hold reasons (e.g. "Confidence 0.58 < min 0.60").
         payload = {
             "chat_id": self.chat_id,
             "text": message,
-            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
 

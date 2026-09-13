@@ -1,6 +1,7 @@
 # core/multi_timeframe.py
 # Multi-timeframe alignment engine
 # v5.1: Morning-bird boost + 2-layer fallback + bug fix (primary_signal NameError)
+# v5.2: PER-ASSET THRESHOLD OVERRIDES — each asset can use its own gates
 # BTCUSD: 15m -> 5m -> 1m  |  V10(1s): 5m -> 1m -> 10s
 
 import os
@@ -82,6 +83,11 @@ class MultiTimeframeEngine:
       confirmation (with confidence penalty) instead of dying at the entry layer
     - Fixed NameError bug: 'primary_signal' was never defined (would crash on
       a full 3-layer alignment)
+
+    v5.2 changes:
+    - threshold_overrides parameter: per-asset gates (e.g. forex-calibrated
+      thresholds for EURUSD). Asset values replace the global ones, then the
+      morning boost relaxes further on top (looser of the two wins).
     """
 
     def __init__(self):
@@ -113,10 +119,11 @@ class MultiTimeframeEngine:
         self.morning_two_layer_min_score = float(os.getenv("MORNING_TWO_LAYER_MIN_SCORE", "0.35"))
 
         logger.info(
-            f"MultiTimeframeEngine v5.1 | Min confidence: {self.min_confidence} | "
+            f"MultiTimeframeEngine v5.2 | Min confidence: {self.min_confidence} | "
             f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
             f"2-layer fallback: {self.allow_two_layer} (score>={self.two_layer_min_score}) | "
-            f"Morning boost: {self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC"
+            f"Morning boost: {self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC | "
+            f"Per-asset overrides: supported"
         )
 
     def _morning_boost_active(self) -> bool:
@@ -128,22 +135,41 @@ class MultiTimeframeEngine:
         return hour >= self.morning_start_utc or hour < self.morning_end_utc
 
     async def analyze_asset(self, pair: str, source: str, timeframes: dict,
-                            data_feed) -> Optional[Dict]:
+                            data_feed, threshold_overrides: Optional[dict] = None) -> Optional[Dict]:
         """
         timeframes = {
             "primary":   {"tf": "15m", "deriv_granularity": 900},
             "secondary": {"tf": "5m",  "deriv_granularity": 300},
             "entry":     {"tf": "1m",  "deriv_granularity": 60}
         }
+
+        threshold_overrides (v5.2) = optional per-asset gates, e.g.:
+            {"min_atr_pct": 0.008, "min_adx": 12,
+             "min_confidence": 0.55, "two_layer_min_score": 0.40}
         """
         self.signal_tracker.clear_old()
         morning = self._morning_boost_active()
 
-        # Effective thresholds (morning window uses relaxed values)
-        eff_min_conf = self.morning_min_confidence if morning else self.min_confidence
-        eff_min_adx = self.morning_min_adx if morning else self.min_adx
-        eff_min_atr = self.morning_min_atr_pct if morning else self.min_atr_pct
-        eff_two_layer_score = self.morning_two_layer_min_score if morning else self.two_layer_min_score
+        # ===== EFFECTIVE THRESHOLDS =====
+        # 1. Start from per-asset override if given, else global default
+        # 2. Morning boost relaxes further (looser of the two wins)
+        base_conf = float(threshold_overrides.get("min_confidence", self.min_confidence)) if threshold_overrides else self.min_confidence
+        base_adx = float(threshold_overrides.get("min_adx", self.min_adx)) if threshold_overrides else self.min_adx
+        base_atr = float(threshold_overrides.get("min_atr_pct", self.min_atr_pct)) if threshold_overrides else self.min_atr_pct
+        base_2l = float(threshold_overrides.get("two_layer_min_score", self.two_layer_min_score)) if threshold_overrides else self.two_layer_min_score
+
+        if morning:
+            eff_min_conf = min(base_conf, self.morning_min_confidence)
+            eff_min_adx = min(base_adx, self.morning_min_adx)
+            eff_min_atr = min(base_atr, self.morning_min_atr_pct)
+            eff_two_layer_score = min(base_2l, self.morning_two_layer_min_score)
+        else:
+            eff_min_conf, eff_min_adx, eff_min_atr, eff_two_layer_score = base_conf, base_adx, base_atr, base_2l
+
+        if threshold_overrides:
+            logger.debug(f"{pair} using per-asset thresholds | ATR>={eff_min_atr}% ADX>={eff_min_adx} "
+                         f"conf>={eff_min_conf} 2L>={eff_two_layer_score}"
+                         f"{' (morning)' if morning else ''}")
 
         # Fetch all 3 timeframes
         frames = {}

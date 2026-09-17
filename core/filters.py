@@ -1,5 +1,10 @@
-# core/filters.py
+core/filters.py
 # v5.0 — 10min cooldown, 4-filter validation, multi-timeframe ready
+# v5.1: Trend-entry RSI acceptance — early trend-start entries naturally
+#       happen with RSI in the 45-62 mid-range, but the old gate only
+#       accepted RSI <= 45 (BUY) / >= 55 (SELL) with momentum. That vetoed
+#       every early structure-break entry the v5.4 engine produces. Now a
+#       rising RSI 45-62 with bullish momentum (and mirror for SELL) passes.
 
 import os
 from datetime import datetime, timedelta
@@ -19,8 +24,9 @@ class FilterManager:
         self.daily_counts: Dict[str, int] = {}
         self.last_reset = datetime.now().date()
         logger.info(
-            f"FilterManager v5.0 | Cooldown: {self.min_interval.total_seconds() / 60:.0f}m | "
-            f"Early: {self.early_interval.total_seconds() / 60:.0f}m | 2/4 early, 3/4 confirmed"
+            f"FilterManager v5.1 | Cooldown: {self.min_interval.total_seconds() / 60:.0f}m | "
+            f"Early: {self.early_interval.total_seconds() / 60:.0f}m | 2/4 early, 3/4 confirmed | "
+            f"Trend-entry RSI band: ON"
         )
 
     def validate_signal(self, df: Optional[pd.DataFrame], signal_type: str, current_price: float,
@@ -134,10 +140,15 @@ class FilterManager:
                 rsi_predictive = (rsi <= 45) and (rsi_momentum > 0)
                 rsi_sweet = 30 <= rsi <= 45
                 rsi_early = (rsi <= 50) and (live_reversal == "BUY_EARLY" or div_type == "BULLISH_DIV")
-                rsi_ok = rsi_predictive or rsi_sweet or rsi_early
+                # v5.1: trend-start entries happen mid-range by nature — the
+                # structure break IS the confirmation. Rising RSI 45-62 with
+                # bullish momentum passes (was: only <=45, which vetoed every
+                # early trend-start the v5.4 engine produces).
+                rsi_trend = (45 <= rsi <= 62) and (rsi_momentum > 0) and (price_momentum >= 0)
+                rsi_ok = rsi_predictive or rsi_sweet or rsi_early or rsi_trend
                 filters_report["rsi"] = {
                     "passed": rsi_ok,
-                    "reason": f"RSI:{rsi:.1f} | Mom:{rsi_momentum:+.2f} | Pred:{rsi_predictive} | Sweet:{rsi_sweet}"
+                    "reason": f"RSI:{rsi:.1f} | Mom:{rsi_momentum:+.2f} | Pred:{rsi_predictive} | Sweet:{rsi_sweet} | Trend:{rsi_trend}"
                 }
             if rsi_ok:
                 passed_filters += 1
@@ -195,10 +206,13 @@ class FilterManager:
                 rsi_predictive = (rsi >= 55) and (rsi_momentum < 0)
                 rsi_sweet = 55 <= rsi <= 70
                 rsi_early = (rsi >= 50) and (live_reversal == "SELL_EARLY" or div_type == "BEARISH_DIV")
-                rsi_ok = rsi_predictive or rsi_sweet or rsi_early
+                # v5.1: mirror of the BUY trend band — falling RSI 38-55 with
+                # bearish momentum passes for early trend-start SELLs.
+                rsi_trend = (38 <= rsi <= 55) and (rsi_momentum < 0) and (price_momentum <= 0)
+                rsi_ok = rsi_predictive or rsi_sweet or rsi_early or rsi_trend
                 filters_report["rsi"] = {
                     "passed": rsi_ok,
-                    "reason": f"RSI:{rsi:.1f} | Mom:{rsi_momentum:+.2f} | Pred:{rsi_predictive} | Sweet:{rsi_sweet}"
+                    "reason": f"RSI:{rsi:.1f} | Mom:{rsi_momentum:+.2f} | Pred:{rsi_predictive} | Sweet:{rsi_sweet} | Trend:{rsi_trend}"
                 }
             if rsi_ok:
                 passed_filters += 1

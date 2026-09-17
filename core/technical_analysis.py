@@ -1,6 +1,19 @@
-# core/technical_analysis.py
+core/technical_analysis.py
 # PREDICTIVE SMC Strategy v4.1 — Fibonacci + Trend Filter
 # Minor v5.0 update: exposes volatility for multi-timeframe engine
+# v5.4: BUG FIXES (the "BTCUSD only BUYs" trio):
+#   1. _calculate_confluence macro hard-veto ("No SELL in uptrend") replaced
+#      with momentum-confirmed counter-trend entries + penalty. The veto made
+#      SELLs impossible whenever price sat above EMA200 — which is where
+#      BTCUSD lives most of the time -> BUY-only output.
+#   2. _calculate_trend_strength was bullish-only (never negative) so bearish
+#      structures scored weak confidence and SELLs failed the gates. Now
+#      direction-aware magnitude: strong uptrend AND strong downtrend both
+#      score high.
+#   3. No-sweep contexts could never reach the 0.60 signal threshold (big
+#      score chunks were sweep-only) -> signals only fired on late retracement
+#      setups. Added symmetric trend-follow scoring (momentum + RSI + MACD-hist
+#      + Fib zone) so aligned trends score on their own, early.
 
 import os
 from typing import Dict, Optional, Tuple, List
@@ -24,8 +37,8 @@ class TechnicalAnalyzer:
         self.pattern_recognizer = CandlestickPatternRecognizer()
         self.fakeout_detector = FakeoutDetector()
         logger.info(
-            f"TechnicalAnalyzer v4.1 | RSI: {self.rsi_buy_low}-{self.rsi_sell_high} | "
-            f"FIBONACCI + CONFLUENCE SCORING"
+            f"TechnicalAnalyzer v5.4 | RSI: {self.rsi_buy_low}-{self.rsi_sell_high} | "
+            f"FIBONACCI + CONFLUENCE SCORING | Symmetric trend-follow scoring ON"
         )
 
     def calculate_indicators(self, df: pd.DataFrame) -> Dict:
@@ -439,9 +452,18 @@ class TechnicalAnalyzer:
             score -= div_score
 
         if sweep_type == "BUY_SWEEP":
+            # v5.4: was a hard HOLD veto when price < EMA200 — that veto is
+            # what made SELLs impossible in BTCUSD uptrends (BUY-only bug).
+            # Now: counter-macro entries allowed ONLY with momentum
+            # confirmation, with a penalty. No momentum -> still HOLD.
             if is_macro_downtrend:
-                reasons.append(f"BLOCKED: Price {current_price:.2f} < 200 EMA — No BUY in downtrend")
-                return abs(score), "HOLD", "\n".join(reasons)
+                mom_confirms = (price_momentum > 0 or rsi_momentum > 0.20
+                                or live_reversal == "BUY_EARLY")
+                if not mom_confirms:
+                    reasons.append(f"BLOCKED: Price {current_price:.2f} < 200 EMA — counter-trend BUY lacks momentum")
+                    return abs(score), "HOLD", "\\n".join(reasons)
+                reasons.append("Counter-trend BUY vs 200 EMA — momentum confirms (penalty -0.20)")
+                score -= 0.20
 
             reasons.append(f"SWEEP: Buy at Support {support:.2f} (quality: {sweep_quality:.2f})")
             score += 0.4 * sweep_quality
@@ -478,9 +500,17 @@ class TechnicalAnalyzer:
                 score -= 0.3
 
         elif sweep_type == "SELL_SWEEP":
+            # v5.4: mirror of the BUY fix — SELL sweeps in a macro uptrend
+            # are allowed with momentum confirmation + penalty instead of an
+            # instant HOLD veto.
             if is_macro_uptrend:
-                reasons.append(f"BLOCKED: Price {current_price:.2f} > 200 EMA — No SELL in uptrend")
-                return abs(score), "HOLD", "\n".join(reasons)
+                mom_confirms = (price_momentum < 0 or rsi_momentum < -0.20
+                                or live_reversal == "SELL_EARLY")
+                if not mom_confirms:
+                    reasons.append(f"BLOCKED: Price {current_price:.2f} > 200 EMA — counter-trend SELL lacks momentum")
+                    return abs(score), "HOLD", "\\n".join(reasons)
+                reasons.append("Counter-trend SELL vs 200 EMA — momentum confirms (penalty +0.20)")
+                score += 0.20
 
             reasons.append(f"SWEEP: Sell at Resistance {resistance:.2f} (quality: {sweep_quality:.2f})")
             score -= 0.4 * sweep_quality
@@ -528,6 +558,44 @@ class TechnicalAnalyzer:
                     reasons.append(f"FIB: Premium zone {nearest_fib}% in downtrend — watch SELL")
                     score -= 0.05
 
+            # v5.4: symmetric trend-follow scoring. Without this, only sweeps
+            # could accumulate meaningful score, so signals fired exclusively
+            # on late retracement setups. Now an aligned, momentum-backed trend
+            # can reach the 0.60 threshold on its own — early, in EITHER
+            # direction (this is what lets BTCUSD fire SELLs in downtrends and
+            # both pairs catch trends at the start instead of the end).
+            trend_aligned_buy = (trend in ["BULLISH", "WEAK_BULLISH", "BULLISH_PULLBACK"]
+                                 and is_macro_uptrend)
+            trend_aligned_sell = (trend in ["BEARISH", "WEAK_BEARISH", "BEARISH_PULLBACK"]
+                                  and is_macro_downtrend)
+
+            if trend_aligned_buy:
+                if price_momentum > 0:
+                    reasons.append("Trend-follow: higher lows (+0.25)")
+                    score += 0.25
+                if 45 <= rsi <= 65 and rsi_momentum > 0:
+                    reasons.append(f"Trend-follow: RSI {rsi:.1f} rising (+0.20)")
+                    score += 0.20
+                if "macd_hist" in df and df["macd_hist"].iloc[-1] > 0:
+                    reasons.append("Trend-follow: MACD hist positive (+0.15)")
+                    score += 0.15
+                if fib_zones and in_golden_zone:
+                    reasons.append(f"Trend-follow: FIB golden pullback {nearest_fib}% (+0.15)")
+                    score += 0.15
+            elif trend_aligned_sell:
+                if price_momentum < 0:
+                    reasons.append("Trend-follow: lower highs (-0.25)")
+                    score -= 0.25
+                if 35 <= rsi <= 55 and rsi_momentum < 0:
+                    reasons.append(f"Trend-follow: RSI {rsi:.1f} falling (-0.20)")
+                    score -= 0.20
+                if "macd_hist" in df and df["macd_hist"].iloc[-1] < 0:
+                    reasons.append("Trend-follow: MACD hist negative (-0.15)")
+                    score -= 0.15
+                if fib_zones and in_premium_zone and fib_position < 25:
+                    reasons.append(f"Trend-follow: FIB premium rally {nearest_fib}% (-0.15)")
+                    score -= 0.15
+
         score += fakeout_boost
 
         signal = "HOLD"
@@ -548,7 +616,7 @@ class TechnicalAnalyzer:
             elif score <= -0.60:
                 signal = "SELL"
 
-        return abs(score), signal, "\n".join(reasons)
+        return abs(score), signal, "\\n".join(reasons)
 
     def _calculate_levels(self, signal: str, df: pd.DataFrame, support: Optional[float], resistance: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         current_price = df["close"].iloc[-1]
@@ -573,28 +641,33 @@ class TechnicalAnalyzer:
         return (last["close"] - last["bb_low"]) / range_val if "bb_low" in last else 0.5
 
     def _calculate_trend_strength(self, df: pd.DataFrame) -> float:
+        # v5.4: was bullish-only (added +1 per bullish check, never
+        # subtracted) so bearish structures always scored weak confidence and
+        # SELLs failed the gates. Now a signed vote: each check votes +1
+        # (bullish alignment) or -1 (bearish alignment) and the magnitude of
+        # the consensus is returned. Strong uptrend AND strong downtrend both
+        # score high; mixed/messy structures score low. ADX (directionless)
+        # is a small bonus, not a directional vote.
         last = df.iloc[-1]
-        score = 0
+        votes = 0
         checks = 0
 
         if "sma_20" in last and "sma_50" in last:
-            if last["sma_20"] > last["sma_50"]:
-                score += 1
+            votes += 1 if last["sma_20"] > last["sma_50"] else -1
             checks += 1
         if "close" in last and "sma_20" in last:
-            if last["close"] > last["sma_20"]:
-                score += 1
+            votes += 1 if last["close"] > last["sma_20"] else -1
             checks += 1
         if "macd" in last and "macd_signal" in last:
-            if last["macd"] > last["macd_signal"]:
-                score += 1
-            checks += 1
-        if "adx" in last:
-            if last["adx"] > 20:
-                score += 1
+            votes += 1 if last["macd"] > last["macd_signal"] else -1
             checks += 1
 
-        return score / checks if checks > 0 else 0.5
+        strength = abs(votes) / checks if checks > 0 else 0.5
+
+        if "adx" in last and last["adx"] > 20:
+            strength = min(strength + 0.15, 1.0)
+
+        return strength
 
     def generate_technical_score(self, indicators: Dict) -> float:
         score = 0.0

@@ -1,4 +1,4 @@
-# core/multi_timeframe.py
+core/multi_timeframe.py
 # Multi-timeframe alignment engine
 # v5.1: Morning-bird boost + 2-layer fallback + bug fix (primary_signal NameError)
 # v5.2: PER-ASSET THRESHOLD OVERRIDES — each asset can use its own gates
@@ -6,6 +6,12 @@
 #       or strong trend), and entry layer must not oppose. Fixes v5.1 buying
 #       the top on a WEAK lean (see Sept 13 incident: primary HOLD/WEAK_BULLISH
 #       fired BUY right into a dump).
+# v5.4: EARLY TREND-START LAYER — EMA9/21 cross + swing-structure break on the
+#       entry TF catches trends at BIRTH instead of waiting for candle-pattern
+#       confirmation (which lagged 1-2h: trend started ~7:00, signal ~9:00).
+#       Also: TREND-START entries when primary is still SIDEWAYS but entry TF
+#       structure has broken AND primary momentum shifted. Fully symmetric —
+#       BUY and SELL use identical logic, so both pairs fire both directions.
 # BTCUSD: 15m -> 5m -> 1m  |  V10(1s): 5m -> 1m -> 10s
 
 import os
@@ -90,6 +96,14 @@ class MultiTimeframeEngine:
       3. Secondary confluence score clears the (morning-adjusted) bar.
       4. Fakeout risk is low.
     Otherwise HOLD and wait for real alignment.
+
+    v5.4 early trend-start layer (symmetric BUY/SELL):
+    - Running trend + quiet entry layer -> EMA9/21 cross + swing-structure
+      break on the entry TF confirms the entry NOW (no pattern wait).
+    - Primary still SIDEWAYS -> if entry structure broke AND primary momentum
+      shifted AND secondary doesn't oppose, fire a TREND-START entry.
+    Hard requirements (alignment + structure break) keep the v5.3 lesson:
+    no firing against structure, only with its birth.
     """
 
     def __init__(self):
@@ -117,9 +131,10 @@ class MultiTimeframeEngine:
         self.morning_two_layer_min_score = float(os.getenv("MORNING_TWO_LAYER_MIN_SCORE", "0.35"))
 
         logger.info(
-            f"MultiTimeframeEngine v5.3 | Min confidence: {self.min_confidence} | "
+            f"MultiTimeframeEngine v5.4 | Min confidence: {self.min_confidence} | "
             f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
             f"2-layer fallback: {self.allow_two_layer} (score>={self.two_layer_min_score}, primary must agree) | "
+            f"Early trend-start layer: ON | "
             f"Morning boost: {self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC | "
             f"Per-asset overrides: supported"
         )
@@ -131,6 +146,84 @@ class MultiTimeframeEngine:
             return self.morning_start_utc <= hour < self.morning_end_utc
         # Window wraps midnight (e.g. 22 -> 6)
         return hour >= self.morning_start_utc or hour < self.morning_end_utc
+
+    # ===== v5.4: EARLY TREND-START DETECTION =====
+    # Catches trends at the START (EMA9/21 cross + swing-structure break on
+    # the entry TF) instead of waiting for confirmed candle patterns, which
+    # by definition lag the move they describe.
+
+    def _detect_early_trend(self, df: pd.DataFrame, direction: str,
+                            lookback: int = 30) -> Tuple[bool, float, str]:
+        """
+        Score-based early trend detection on the entry timeframe.
+        Requires EMA alignment AND a break of the recent swing (the structure
+        break is the actual birth of a trend). A fresh cross adds confidence.
+        Fully symmetric: BUY and SELL run identical math mirrored.
+        Returns (detected, score 0..1, reason).
+        """
+        if df is None or len(df) < max(60, lookback + 10):
+            return False, 0.0, "insufficient data"
+
+        close = df["close"].astype(float)
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+
+        ema_fast = close.ewm(span=9, adjust=False).mean()
+        ema_slow = close.ewm(span=21, adjust=False).mean()
+        cur_f, cur_s = ema_fast.iloc[-1], ema_slow.iloc[-1]
+
+        if direction == "BUY":
+            cross = (ema_fast.shift(1) <= ema_slow.shift(1)) & (ema_fast > ema_slow)
+            aligned = cur_f > cur_s
+            swing = high.iloc[-lookback - 1:-1].max()
+            broke_structure = close.iloc[-1] > swing
+            momentum = close.iloc[-1] > close.iloc[-6]
+        else:
+            cross = (ema_fast.shift(1) >= ema_slow.shift(1)) & (ema_fast < ema_slow)
+            aligned = cur_f < cur_s
+            swing = low.iloc[-lookback - 1:-1].min()
+            broke_structure = close.iloc[-1] < swing
+            momentum = close.iloc[-1] < close.iloc[-6]
+
+        score, reasons = 0.0, []
+        if bool(cross.iloc[-10:].any()):
+            score += 0.45
+            reasons.append("fresh EMA9/21 cross")
+        elif aligned:
+            score += 0.30
+            reasons.append("EMA alignment")
+        if broke_structure:
+            score += 0.35
+            reasons.append(f"structure break vs {lookback}-bar swing")
+        if momentum:
+            score += 0.20
+            reasons.append("momentum")
+
+        # Hard requirements: EMA alignment + structure break. Cross/momentum
+        # only modulate confidence — keeps v5.3's lesson (no blind early
+        # fires against structure; only with its break).
+        detected = aligned and broke_structure and score >= 0.60
+        return detected, min(score, 1.0), "+".join(reasons) or "no early trend"
+
+    def _primary_momentum_shift(self, df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
+        """
+        PRIMARY timeframe: has momentum shifted in `direction`? Used to allow
+        trend-start entries while market_structure is still SIDEWAYS — requires
+        price on the right side of a RISING (BUY) / FALLING (SELL) EMA21.
+        """
+        if df is None or len(df) < 40:
+            return False, "insufficient primary data"
+        close = df["close"].astype(float)
+        ema21 = close.ewm(span=21, adjust=False).mean()
+        cur, e, e_prev = close.iloc[-1], ema21.iloc[-1], ema21.iloc[-6]
+
+        if direction == "BUY":
+            ok = cur > e and e > e_prev
+            desc = "price above rising EMA21"
+        else:
+            ok = cur < e and e < e_prev
+            desc = "price below falling EMA21"
+        return ok, desc
 
     async def analyze_asset(self, pair: str, source: str, timeframes: dict,
                             data_feed, threshold_overrides: Optional[dict] = None) -> Optional[Dict]:
@@ -231,6 +324,10 @@ class MultiTimeframeEngine:
                 "layers": self._summarize_layers(analyses)
             }
 
+        # ===== SETUP PRE-READ (needed by trend-start detection too) =====
+        secondary_signal = secondary.get("smc_suggested_signal", "HOLD")
+        secondary_score = secondary.get("confluence_score", 0)
+
         # ===== DIRECTION CHECK (Primary) =====
         primary_trend = primary.get("market_structure", "SIDEWAYS")
         primary_signal = primary.get("smc_suggested_signal", "HOLD")
@@ -240,39 +337,55 @@ class MultiTimeframeEngine:
         elif primary_trend in ["BEARISH", "BEARISH_PULLBACK", "WEAK_BEARISH"]:
             trend_direction = "SELL"
 
+        early_trend_start = False
+        early_start_score = 0.0
+
         if trend_direction is None:
-            return {
-                "pair": pair, "signal": "HOLD",
-                "reason": f"Primary trend unclear: {primary_trend}",
-                "volatility_passed": True,
-                "secondary_indicators": secondary,
-                "secondary_df": frames["secondary"],
-                "layers": self._summarize_layers(analyses)
-            }
+            # v5.4: TREND-START catch — primary hasn't labeled a trend yet,
+            # but the entry TF shows a fresh EMA cross + structure break AND
+            # primary momentum has shifted. Catches the move at birth instead
+            # of waiting for the 15m label (which arrives hours late).
+            for try_dir in ("BUY", "SELL"):
+                e_ok, e_score, e_reason = self._detect_early_trend(frames["entry"], try_dir)
+                if not e_ok:
+                    continue
+                m_ok, m_reason = self._primary_momentum_shift(frames["primary"], try_dir)
+                if not m_ok:
+                    continue
+                if secondary_signal not in (try_dir, "HOLD"):
+                    continue  # secondary actively opposes — not a trend start
+                trend_direction = try_dir
+                early_trend_start = True
+                early_start_score = e_score
+                logger.info(f"{pair} EARLY TREND START: {try_dir} | {e_reason} | {m_reason}")
+                break
+
+            if trend_direction is None:
+                return {
+                    "pair": pair, "signal": "HOLD",
+                    "reason": f"Primary trend unclear: {primary_trend}",
+                    "volatility_passed": True,
+                    "secondary_indicators": secondary,
+                    "secondary_df": frames["secondary"],
+                    "layers": self._summarize_layers(analyses)
+                }
 
         # ===== SETUP CHECK (Secondary) =====
-        secondary_signal = secondary.get("smc_suggested_signal", "HOLD")
-        secondary_score = secondary.get("confluence_score", 0)
-
-        if secondary_signal not in ["BUY", "SELL"]:
-            return {
-                "pair": pair, "signal": "HOLD",
-                "reason": f"No valid setup on secondary ({secondary_signal})",
-                "volatility_passed": True,
-                "secondary_indicators": secondary,
-                "secondary_df": frames["secondary"],
-                "layers": self._summarize_layers(analyses)
-            }
-
         if secondary_signal != trend_direction:
-            return {
-                "pair": pair, "signal": "HOLD",
-                "reason": f"Secondary ({secondary_signal}) vs Primary ({trend_direction}) conflict",
-                "volatility_passed": True,
-                "secondary_indicators": secondary,
-                "secondary_df": frames["secondary"],
-                "layers": self._summarize_layers(analyses)
-            }
+            # v5.4: neutral secondary + fresh entry structure break is NOT a
+            # conflict — that's precisely the trend-start case. Anything else
+            # (opposing signal) still blocks, as before.
+            if not (early_trend_start and secondary_signal == "HOLD"):
+                return {
+                    "pair": pair, "signal": "HOLD",
+                    "reason": (f"No valid setup on secondary ({secondary_signal})"
+                               if secondary_signal not in ["BUY", "SELL"]
+                               else f"Secondary ({secondary_signal}) vs Primary ({trend_direction}) conflict"),
+                    "volatility_passed": True,
+                    "secondary_indicators": secondary,
+                    "secondary_df": frames["secondary"],
+                    "layers": self._summarize_layers(analyses)
+                }
 
         # ===== ENTRY CHECK (Entry timeframe) =====
         entry_signal = entry.get("smc_suggested_signal", "HOLD")
@@ -283,6 +396,7 @@ class MultiTimeframeEngine:
 
         entry_confirms = False
         entry_confidence = 0.0
+        early_entry = False
 
         if entry_signal == trend_direction and entry_score >= 0.30:
             entry_confirms = True
@@ -299,6 +413,24 @@ class MultiTimeframeEngine:
             if div == expected_div:
                 entry_confirms = True
                 entry_confidence = 0.40
+
+        if not entry_confirms:
+            if early_trend_start:
+                # Entry confirmation = the structure break that started it all
+                entry_confirms = True
+                entry_confidence = early_start_score * 0.75
+                early_entry = True
+            else:
+                # v5.4: trend running but entry layer quiet — catch it NOW via
+                # EMA cross + structure break instead of waiting for a candle
+                # pattern to confirm (that wait caused the 2h-late EURUSD SELL
+                # after the downtrend had already ended).
+                e_ok, e_score, e_reason = self._detect_early_trend(frames["entry"], trend_direction)
+                if e_ok:
+                    entry_confirms = True
+                    entry_confidence = e_score * 0.75  # penalty: unconfirmed
+                    early_entry = True
+                    logger.info(f"{pair} EARLY ENTRY [{trend_direction}]: {e_reason}")
 
         # ===== 2-LAYER FALLBACK (v5.3 tightened) =====
         # Direction + setup agree but entry layer is quiet. Fire ONLY when the
@@ -367,6 +499,9 @@ class MultiTimeframeEngine:
         if two_layer_mode:
             combined *= 0.85  # penalty for missing entry-layer confirmation
 
+        if early_entry:
+            combined *= 0.90  # v5.4: modest penalty for unconfirmed early entry
+
         if secondary.get("fakeout_detected") and secondary.get("fakeout_risk", 0) > 0.3:
             combined *= 0.7
 
@@ -427,7 +562,9 @@ class MultiTimeframeEngine:
             "stop_loss": round(stop_loss, 2),
             "take_profit": round(take_profit, 2),
             "reason": self._build_reason(analyses, trend_direction, combined,
-                                         two_layer_mode=two_layer_mode, morning=morning),
+                                         two_layer_mode=two_layer_mode, morning=morning,
+                                         early_trend_start=early_trend_start,
+                                         early_entry=early_entry),
             "volatility_passed": True,
             "primary_trend": primary_trend,
             "secondary_score": round(secondary_score, 3),
@@ -437,8 +574,10 @@ class MultiTimeframeEngine:
             "secondary_indicators": secondary,
             "secondary_df": frames["secondary"],
             "layers": self._summarize_layers(analyses),
-            "is_early": combined < 0.80 or two_layer_mode,
+            "is_early": combined < 0.80 or two_layer_mode or early_entry or early_trend_start,
             "two_layer_mode": two_layer_mode,
+            "early_trend_start": early_trend_start,
+            "early_entry": early_entry,
             "morning_boost": morning,
             "setup_hash": setup_hash
         }
@@ -455,7 +594,8 @@ class MultiTimeframeEngine:
         }
 
     def _build_reason(self, analyses: dict, signal: str, confidence: float,
-                      two_layer_mode: bool = False, morning: bool = False) -> str:
+                      two_layer_mode: bool = False, morning: bool = False,
+                      early_trend_start: bool = False, early_entry: bool = False) -> str:
         p = analyses["primary"]
         s = analyses["secondary"]
         e = analyses["entry"]
@@ -472,6 +612,11 @@ class MultiTimeframeEngine:
             parts.append(f"Entry: {e.get('live_reversal')}")
         elif e.get("candlestick_signal") != "HOLD":
             parts.append(f"Entry pattern: {e.get('candlestick_signal')}")
+
+        if early_trend_start:
+            parts.append("⚡ TREND-START catch: primary still neutral, entry structure broken + EMA cross")
+        elif early_entry:
+            parts.append("⚡ EARLY entry: EMA cross + structure break (pattern not yet confirmed)")
 
         if s.get("fakeout_detected"):
             parts.append(f"Fakeout risk: {s.get('fakeout_risk', 0) * 100:.0f}%")

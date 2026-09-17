@@ -1,3 +1,4 @@
+# core/technical_analysis.py
 # PREDICTIVE SMC Strategy v4.1 — Fibonacci + Trend Filter
 # Minor v5.0 update: exposes volatility for multi-timeframe engine
 # v5.4: BUG FIXES (the "BTCUSD only BUYs" trio):

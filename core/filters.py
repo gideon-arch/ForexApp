@@ -1,4 +1,4 @@
-core/filters.py
+#core/filters.py
 # v5.0 — 10min cooldown, 4-filter validation, multi-timeframe ready
 # v5.1: Trend-entry RSI acceptance — early trend-start entries naturally
 #       happen with RSI in the 45-62 mid-range, but the old gate only

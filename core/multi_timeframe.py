@@ -1,4 +1,4 @@
-core/multi_timeframe.py
+#core/multi_timeframe.py
 # Multi-timeframe alignment engine
 # v5.1: Morning-bird boost + 2-layer fallback + bug fix (primary_signal NameError)
 # v5.2: PER-ASSET THRESHOLD OVERRIDES — each asset can use its own gates

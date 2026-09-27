@@ -37,6 +37,13 @@ class DataFeedManager:
         }
         return mapping.get(str(deriv_granularity), "5m")
 
+    def _kraken_tf_to_deriv_granularity(self, tf: str) -> int:
+        mapping = {
+            "1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900,
+            "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400
+        }
+        return mapping.get(tf, 300)
+
     async def fetch_latest(self, pair: str = "BTCUSD", timeframe: str = "5m",
                            source: str = "kraken", deriv_symbol: str = None,
                            fallback: bool = True) -> Optional[pd.DataFrame]:
@@ -75,21 +82,53 @@ class DataFeedManager:
                 except Exception as e:
                     logger.error(f"Binance fallback failed: {e}")
 
-            # EURUSD fallback: Deriv -> Kraken
-            # BUG FIX: this used to pass the raw Deriv symbol ("frxEURUSD")
-            # straight to Kraken, which has no such pair — so the fallback
-            # always silently failed. Strip the "frx" prefix first.
-            if "EUR" in pair.upper() and "deriv" in tried:
-                kraken_fallback_pair = pair.upper().replace("FRX", "")
-                logger.warning(f"🔄 Deriv failed, trying Kraken for {kraken_fallback_pair}...")
+            # EURUSD fallback — symmetric now that Kraken is primary:
+            #   Kraken fails -> try Deriv (frxEURUSD)
+            #   Deriv fails  -> try Kraken (kept for backward-compat if
+            #                   EURUSD is ever configured Deriv-primary again)
+            if "EUR" in pair.upper():
+                if "kraken" in tried and "deriv" not in tried:
+                    logger.warning(f"🔄 Kraken failed, trying Deriv for {pair}...")
+                    try:
+                        deriv_gran = int(timeframe) if str(timeframe).isdigit() else self._kraken_tf_to_deriv_granularity(timeframe)
+                        df = await self._fetch_from_deriv("frxEURUSD", deriv_gran)
+                        tried.append("deriv")
+                        if df is not None:
+                            logger.info(f"✅ Deriv fallback succeeded for {pair}")
+                    except Exception as e:
+                        logger.error(f"Deriv fallback failed: {e}")
+                elif "deriv" in tried and "kraken" not in tried:
+                    # BUG FIX: this used to pass the raw Deriv symbol
+                    # ("frxEURUSD") straight to Kraken, which has no such
+                    # pair — so the fallback always silently failed. Strip
+                    # the "frx" prefix first.
+                    kraken_fallback_pair = pair.upper().replace("FRX", "")
+                    logger.warning(f"🔄 Deriv failed, trying Kraken for {kraken_fallback_pair}...")
+                    try:
+                        kraken_tf = self._deriv_to_kraken_tf(timeframe) if str(timeframe).isdigit() else timeframe
+                        df = await self._fetch_from_kraken(kraken_fallback_pair, kraken_tf)
+                        tried.append("kraken")
+                        if df is not None:
+                            logger.info(f"✅ Kraken fallback succeeded for {kraken_fallback_pair}")
+                    except Exception as e:
+                        logger.error(f"Kraken fallback failed: {e}")
+
+            # XAUUSD/Gold fallback: Deriv (with internal retry) -> Kraken
+            # PAXG/USD as a proxy. PAXG is a gold-BACKED token, not spot gold
+            # itself — it tracks closely but trades 24/7 (spot gold doesn't
+            # trade weekends) and can carry a small premium/discount. Used
+            # only as a last resort when Deriv is unreachable, and flagged
+            # loudly in the logs so it's never mistaken for real spot gold.
+            if ("XAU" in pair.upper() or "GOLD" in pair.upper()) and "deriv" in tried and "kraken" not in tried:
+                logger.warning(f"🔄 Deriv unavailable after retries, trying Kraken PAXG/USD proxy for {pair}...")
                 try:
                     kraken_tf = self._deriv_to_kraken_tf(timeframe) if str(timeframe).isdigit() else timeframe
-                    df = await self._fetch_from_kraken(kraken_fallback_pair, kraken_tf)
-                    tried.append("kraken")
+                    df = await self._fetch_from_kraken("XAUUSD", kraken_tf)  # mapped to PAXGUSD below
+                    tried.append("kraken(PAXG-proxy)")
                     if df is not None:
-                        logger.info(f"✅ Kraken fallback succeeded for {kraken_fallback_pair}")
+                        logger.warning(f"⚠️ Using PAXG/USD as a gold PROXY for {pair} — Deriv unavailable, prices may drift slightly from spot")
                 except Exception as e:
-                    logger.error(f"Kraken fallback failed: {e}")
+                    logger.error(f"Kraken PAXG fallback failed: {e}")
 
         if df is not None and len(df) >= 50:
             self.cache[cache_key] = (datetime.now(), df)
@@ -119,6 +158,10 @@ class DataFeedManager:
         kraken_pair_map = {
             "BTCUSD": "XXBTZUSD", "BTC-USD": "XXBTZUSD", "XBTUSD": "XXBTZUSD",
             "EURUSD": "EURUSD", "EUR-USD": "EURUSD",
+            # PAXG = gold-backed token, used as a PROXY when Deriv is down.
+            # Not identical to spot gold (trades 24/7, small premium drift)
+            # — see the warning logged wherever this mapping is used.
+            "XAUUSD": "PAXGUSD", "GOLD": "PAXGUSD", "XAU-USD": "PAXGUSD",
         }
         kraken_pair = kraken_pair_map.get(pair.upper(), pair.upper())
 
@@ -200,52 +243,72 @@ class DataFeedManager:
             return None
 
     # ========== DERIV ==========
-    async def _fetch_from_deriv(self, symbol: str, granularity: int, count: int = 200) -> Optional[pd.DataFrame]:
+    async def _fetch_from_deriv(self, symbol: str, granularity: int, count: int = 200,
+                                retries: int = 2) -> Optional[pd.DataFrame]:
+        """
+        v5.4.2: retries transient connection failures (e.g. the HTTP 520
+        "server rejected WebSocket connection" seen on Render — Deriv's edge
+        occasionally rejects a fresh connection under load/rate-limiting).
+        `retries` = extra attempts AFTER the first try, with backoff
+        1s, 2s, 4s... Only retries connection-level failures, not a clean
+        "no candles" API response (that's a real answer, not a hiccup).
+        """
         import websockets
         import json
 
         uri = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+        attempt = 0
 
-        try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
-                req = {
-                    "ticks_history": symbol,
-                    "adjust_start_time": 1,
-                    "count": count,
-                    "end": "latest",
-                    "start": 1,
-                    "style": "candles",
-                    "granularity": granularity
-                }
-                await ws.send(json.dumps(req))
-                response = await asyncio.wait_for(ws.recv(), timeout=15.0)
-                data = json.loads(response)
+        while True:
+            try:
+                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
+                    req = {
+                        "ticks_history": symbol,
+                        "adjust_start_time": 1,
+                        "count": count,
+                        "end": "latest",
+                        "start": 1,
+                        "style": "candles",
+                        "granularity": granularity
+                    }
+                    await ws.send(json.dumps(req))
+                    response = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                    data = json.loads(response)
 
-                if data.get("msg_type") != "candles":
-                    err = data.get("error", {})
-                    logger.error(f"Deriv API error for {symbol}: {err}")
-                    return None
+                    if data.get("msg_type") != "candles":
+                        err = data.get("error", {})
+                        logger.error(f"Deriv API error for {symbol}: {err}")
+                        return None
 
-                candles = data.get("candles", [])
-                if not candles:
-                    logger.error(f"No candles from Deriv for {symbol}")
-                    return None
+                    candles = data.get("candles", [])
+                    if not candles:
+                        logger.error(f"No candles from Deriv for {symbol}")
+                        return None
 
-                df = pd.DataFrame(candles)
-                df["timestamp"] = pd.to_datetime(df["epoch"], unit="s")
+                    df = pd.DataFrame(candles)
+                    df["timestamp"] = pd.to_datetime(df["epoch"], unit="s")
 
-                for col in ["open", "high", "low", "close"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                    for col in ["open", "high", "low", "close"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-                df["volume"] = 0.0
-                df["vwap"] = df["close"]
-                df["trades"] = 0
+                    df["volume"] = 0.0
+                    df["vwap"] = df["close"]
+                    df["trades"] = 0
 
-                df = df[["timestamp", "open", "high", "low", "close", "volume", "vwap", "trades"]]
-                df.dropna(inplace=True)
-                logger.info(f"Deriv: {len(df)} candles for {symbol} ({granularity}s)")
-                return df
+                    df = df[["timestamp", "open", "high", "low", "close", "volume", "vwap", "trades"]]
+                    df.dropna(inplace=True)
+                    logger.info(f"Deriv: {len(df)} candles for {symbol} ({granularity}s)")
+                    return df
 
-        except Exception as e:
-            logger.error(f"Deriv fetch error for {symbol}: {type(e).__name__}: {e}")
-            return None
+            except Exception as e:
+                if attempt < retries:
+                    wait = 2 ** attempt  # 1s, 2s, 4s...
+                    logger.warning(
+                        f"Deriv connection issue for {symbol} ({type(e).__name__}: {e}) — "
+                        f"retry {attempt + 1}/{retries} in {wait}s"
+                    )
+                    await asyncio.sleep(wait)
+                    attempt += 1
+                    continue
+                logger.error(f"Deriv fetch error for {symbol}: {type(e).__name__}: {e}")
+                return None

@@ -1,11 +1,16 @@
-# main.py - AI Crypto Signal Bot v5.3
+# main.py - AI Crypto Signal Bot v5.4.2
 # Multi-Asset | Multi-Timeframe | /analyze endpoint for cron-job.org
-# BTCUSD (Kraken): 15m -> 5m -> 1m
-# EURUSD (Deriv -> Kraken fallback): 15m -> 5m -> 1m
+# BTCUSD (Kraken, Binance fallback): 15m -> 5m -> 1m
+# EURUSD (Kraken primary, Deriv fallback): 15m -> 5m -> 1m
+# XAUUSD (Deriv primary w/ retry, Kraken PAXG/USD proxy fallback): 15m -> 5m -> 1m
 # v5.1: 8h Telegram summary + morning-bird checks + per-cycle log heartbeat
 # v5.2: PER-ASSET THRESHOLDS — EURUSD forex-calibrated gates
 # v5.3: Summary send result logged properly + version bumps (2-layer quality
 #       gate lives in multi_timeframe.py)
+# v5.4.1: Reversal override (fixes stale-trend BUY/SELL lock) + Gold added
+# v5.4.2: EURUSD moved to Kraken-primary (was flaking on Deriv HTTP 520s;
+#         Deriv is now just its fallback) + Deriv retry/backoff + Kraken
+#         PAXG/USD proxy fallback for gold when Deriv is unreachable
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -58,9 +63,8 @@ class CloudForexEngine:
                 "check_interval": 300,
                 "thresholds": None  # uses engine global defaults (crypto-calibrated)
             },
-            "frxEURUSD": {
-                "source": "deriv",
-                "display_name": "EURUSD",
+            "EURUSD": {
+                "source": "kraken",
                 "timeframes": {
                     "primary":   {"tf": "15m", "deriv_granularity": 900},
                     "secondary": {"tf": "5m",  "deriv_granularity": 300},
@@ -110,7 +114,7 @@ class CloudForexEngine:
         # ===== Summary heartbeat interval (hours) =====
         self.summary_interval_hours = float(os.getenv("SUMMARY_INTERVAL_HOURS", "8"))
 
-        logger.info("CloudForexEngine v5.4.1 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
+        logger.info("CloudForexEngine v5.4.2 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
 
     def _morning_active(self) -> bool:
         hour = datetime.utcnow().hour
@@ -119,13 +123,13 @@ class CloudForexEngine:
         return hour >= self.morning_start_utc or hour < self.morning_end_utc
 
     async def initialize(self):
-        logger.info("Initializing Engine v5.4.1...")
+        logger.info("Initializing Engine v5.4.2...")
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
 
             await self.notification_manager.send_test_message(
-                "🤖 AI Crypto Bot v5.4.1 is ONLINE!\n"
+                "🤖 AI Crypto Bot v5.4.2 is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Assets: BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken)\n"
                 "📐 15m → 5m → 1m for all\n"
@@ -133,9 +137,9 @@ class CloudForexEngine:
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.4.1: Reversal override fix (stale-trend BUY/SELL lock) "
+                "🆕 v5.4.2: Reversal override fix (stale-trend BUY/SELL lock) "
                 "+ EURUSD Kraken-fallback fix + Gold added\n"
-                "⚙️ Version: 5.4.1"
+                "⚙️ Version: 5.4.2"
             )
             logger.info("Startup message sent")
 
@@ -150,7 +154,7 @@ class CloudForexEngine:
                 }
 
             app_state['is_running'] = True
-            logger.info("Engine v5.4.1 ready!")
+            logger.info("Engine v5.4.2 ready!")
 
         except Exception as e:
             logger.error(f"Engine init failed: {e}")
@@ -208,7 +212,7 @@ class CloudForexEngine:
         lines.append(f"🌅 Morning boost: {'ACTIVE' if morning else 'off'} "
                      f"({self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC)")
         lines.append(f"⏱️ Check cycle: {self._current_check_interval()}s | Summary every {self.summary_interval_hours:g}h")
-        lines.append("🤖 AI Bot v5.4.1")
+        lines.append("🤖 AI Bot v5.4.2")
 
         # v5.3: log the ACTUAL result instead of claiming success
         success = await self.notification_manager.send_test_message("\n".join(lines))
@@ -390,7 +394,7 @@ class CloudForexEngine:
             await self.notification_manager.close()
         if redis_client:
             await redis_client.close()
-        logger.info("Engine v5.4.1 stopped")
+        logger.info("Engine v5.4.2 stopped")
 
 
 @asynccontextmanager
@@ -405,7 +409,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD + XAUUSD",
-    version="5.4.1",
+    version="5.4.2",
     lifespan=lifespan
 )
 
@@ -424,7 +428,7 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "assets": assets,
-        "version": "5.4.1",
+        "version": "5.4.2",
         "mode": "Multi-Timeframe | Per-Asset Thresholds | Morning Boost | Reversal Override | Quality-Gated 2-Layer"
     }
 
@@ -436,7 +440,7 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "5.4.1",
+        "version": "5.4.2",
         "morning_boost_active": engine._morning_active(),
         "check_interval_seconds": engine._current_check_interval(),
         "assets": {
@@ -485,7 +489,7 @@ async def get_all_signals():
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available")
     signals = {}
-    for asset in ["BTCUSD", "frxEURUSD", "frxXAUUSD"]:
+    for asset in ["BTCUSD", "EURUSD", "frxXAUUSD"]:
         data = await redis_client.get(f"signal:{asset}:current")
         if data:
             signals[asset] = json.loads(data)

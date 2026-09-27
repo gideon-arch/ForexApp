@@ -1,4 +1,4 @@
-#core/multi_timeframe.py
+# core/multi_timeframe.py
 # Multi-timeframe alignment engine
 # v5.1: Morning-bird boost + 2-layer fallback + bug fix (primary_signal NameError)
 # v5.2: PER-ASSET THRESHOLD OVERRIDES — each asset can use its own gates
@@ -104,6 +104,25 @@ class MultiTimeframeEngine:
       shifted AND secondary doesn't oppose, fire a TREND-START entry.
     Hard requirements (alignment + structure break) keep the v5.3 lesson:
     no firing against structure, only with its birth.
+
+    v5.4.1 REVERSAL OVERRIDE (root-cause fix for "bot stuck buying while
+    market is selling"):
+    Previously, once `primary_trend` (15m, EMA200-based) locked in a
+    direction, it stayed locked until the 15m EMA200 relationship itself
+    flipped — which lags a real reversal by many candles. During that lag,
+    the hard trend block in filters.py additionally vetoed any opposite
+    signal on the SAME stale logic (5m version), so even if this engine
+    somehow produced a counter-signal, filters.py killed it again. Two
+    independent layers of the same lag.
+    Now: after establishing trend_direction from primary as before, the
+    engine separately checks whether the ENTRY timeframe shows a strong,
+    fresh reversal (EMA9/21 cross + structure break, score >= 0.75) against
+    that stale direction, confirmed by a primary momentum shift (price vs
+    EMA21, which reacts far faster than EMA200) and a secondary layer that
+    is not actively opposing. Only when all three agree does the direction
+    flip early, tagged `reversal_override=True`. That flag is passed all the
+    way to filters.py so the stale-structure hard block doesn't veto the
+    very reversal this logic just confirmed.
     """
 
     def __init__(self):
@@ -130,11 +149,14 @@ class MultiTimeframeEngine:
         self.morning_min_atr_pct = float(os.getenv("MORNING_MIN_ATR_PCT", "0.015"))
         self.morning_two_layer_min_score = float(os.getenv("MORNING_TWO_LAYER_MIN_SCORE", "0.35"))
 
+        # ===== REVERSAL OVERRIDE (v5.4.1) =====
+        self.reversal_min_score = float(os.getenv("REVERSAL_MIN_SCORE", "0.75"))
+
         logger.info(
-            f"MultiTimeframeEngine v5.4 | Min confidence: {self.min_confidence} | "
+            f"MultiTimeframeEngine v5.4.1 | Min confidence: {self.min_confidence} | "
             f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
             f"2-layer fallback: {self.allow_two_layer} (score>={self.two_layer_min_score}, primary must agree) | "
-            f"Early trend-start layer: ON | "
+            f"Early trend-start layer: ON | Reversal override: ON (score>={self.reversal_min_score}) | "
             f"Morning boost: {self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC | "
             f"Per-asset overrides: supported"
         )
@@ -339,6 +361,7 @@ class MultiTimeframeEngine:
 
         early_trend_start = False
         early_start_score = 0.0
+        reversal_override = False
 
         if trend_direction is None:
             # v5.4: TREND-START catch — primary hasn't labeled a trend yet,
@@ -369,6 +392,29 @@ class MultiTimeframeEngine:
                     "secondary_df": frames["secondary"],
                     "layers": self._summarize_layers(analyses)
                 }
+        else:
+            # ===== v5.4.1 REVERSAL OVERRIDE =====
+            # Primary (15m EMA200) still calls the OLD direction, but that
+            # measure is slow by design. Check whether the entry TF shows a
+            # strong, fresh reversal the other way, confirmed by primary
+            # momentum (EMA21 — much faster than EMA200) and not actively
+            # opposed by secondary. This is what lets the bot flip to SELL
+            # while price is actually dropping instead of waiting for the
+            # 15m EMA200 to catch up (the exact scenario that blew the
+            # account: bot kept saying BUY while the market was selling).
+            opposite_dir = "SELL" if trend_direction == "BUY" else "BUY"
+            e_ok, e_score, e_reason = self._detect_early_trend(frames["entry"], opposite_dir)
+            if e_ok and e_score >= self.reversal_min_score:
+                m_ok, m_reason = self._primary_momentum_shift(frames["primary"], opposite_dir)
+                if m_ok and secondary_signal in (opposite_dir, "HOLD"):
+                    logger.info(
+                        f"{pair} REVERSAL OVERRIDE: {trend_direction} -> {opposite_dir} "
+                        f"| stale primary trend: {primary_trend} | {e_reason} | {m_reason}"
+                    )
+                    trend_direction = opposite_dir
+                    early_trend_start = True
+                    early_start_score = e_score
+                    reversal_override = True
 
         # ===== SETUP CHECK (Secondary) =====
         if secondary_signal != trend_direction:
@@ -444,6 +490,7 @@ class MultiTimeframeEngine:
             primary_actively_agrees = (
                 primary_signal == trend_direction
                 or primary_trend in ["BULLISH", "BEARISH"]
+                or reversal_override
             )
 
             if entry_opposes:
@@ -501,6 +548,9 @@ class MultiTimeframeEngine:
 
         if early_entry:
             combined *= 0.90  # v5.4: modest penalty for unconfirmed early entry
+
+        if reversal_override:
+            combined *= 0.90  # v5.4.1: modest penalty for overriding a stale trend read
 
         if secondary.get("fakeout_detected") and secondary.get("fakeout_risk", 0) > 0.3:
             combined *= 0.7
@@ -564,7 +614,9 @@ class MultiTimeframeEngine:
             "reason": self._build_reason(analyses, trend_direction, combined,
                                          two_layer_mode=two_layer_mode, morning=morning,
                                          early_trend_start=early_trend_start,
-                                         early_entry=early_entry),
+                                         early_entry=early_entry,
+                                         reversal_override=reversal_override,
+                                         primary_trend_raw=primary_trend),
             "volatility_passed": True,
             "primary_trend": primary_trend,
             "secondary_score": round(secondary_score, 3),
@@ -574,10 +626,11 @@ class MultiTimeframeEngine:
             "secondary_indicators": secondary,
             "secondary_df": frames["secondary"],
             "layers": self._summarize_layers(analyses),
-            "is_early": combined < 0.80 or two_layer_mode or early_entry or early_trend_start,
+            "is_early": combined < 0.80 or two_layer_mode or early_entry or early_trend_start or reversal_override,
             "two_layer_mode": two_layer_mode,
             "early_trend_start": early_trend_start,
             "early_entry": early_entry,
+            "reversal_override": reversal_override,
             "morning_boost": morning,
             "setup_hash": setup_hash
         }
@@ -595,7 +648,8 @@ class MultiTimeframeEngine:
 
     def _build_reason(self, analyses: dict, signal: str, confidence: float,
                       two_layer_mode: bool = False, morning: bool = False,
-                      early_trend_start: bool = False, early_entry: bool = False) -> str:
+                      early_trend_start: bool = False, early_entry: bool = False,
+                      reversal_override: bool = False, primary_trend_raw: str = "") -> str:
         p = analyses["primary"]
         s = analyses["secondary"]
         e = analyses["entry"]
@@ -613,7 +667,10 @@ class MultiTimeframeEngine:
         elif e.get("candlestick_signal") != "HOLD":
             parts.append(f"Entry pattern: {e.get('candlestick_signal')}")
 
-        if early_trend_start:
+        if reversal_override:
+            parts.append(f"🔄 REVERSAL OVERRIDE: stale primary read ({primary_trend_raw}) overridden by "
+                         f"confirmed entry-TF reversal + EMA21 momentum shift")
+        elif early_trend_start:
             parts.append("⚡ TREND-START catch: primary still neutral, entry structure broken + EMA cross")
         elif early_entry:
             parts.append("⚡ EARLY entry: EMA cross + structure break (pattern not yet confirmed)")

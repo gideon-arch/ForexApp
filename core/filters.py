@@ -30,7 +30,8 @@ class FilterManager:
         )
 
     def validate_signal(self, df: Optional[pd.DataFrame], signal_type: str, current_price: float,
-                        indicators: Optional[Dict] = None, pair: str = "", is_early: bool = False) -> Tuple[bool, Dict]:
+                        indicators: Optional[Dict] = None, pair: str = "", is_early: bool = False,
+                        is_reversal: bool = False) -> Tuple[bool, Dict]:
         now = datetime.now()
         if now.date() != self.last_reset:
             self.daily_counts = {}
@@ -81,27 +82,42 @@ class FilterManager:
         total_filters = 0
 
         # ===== HARD TREND BLOCK =====
+        # v5.4.1: this block uses the SECONDARY timeframe's market_structure,
+        # which is EMA200/swing based and lags a real-time reversal by
+        # several candles — exactly like the primary-timeframe lag in
+        # multi_timeframe.py. When the multi-timeframe engine has already
+        # confirmed a reversal (fresh EMA9/21 cross + structure break on the
+        # entry TF + primary momentum shift + secondary not opposing), it
+        # sets is_reversal=True and this stale-trend veto is bypassed —
+        # otherwise a confirmed reversal signal would be vetoed right back
+        # into a HOLD by the very structure reading it just overrode.
         trend_blocked = False
-        if signal_type == "BUY":
-            if market_structure in ["BEARISH", "BEARISH_PULLBACK", "WEAK_BEARISH"]:
-                trend_blocked = True
-                filters_report["hard_trend_block"] = {
-                    "passed": False,
-                    "reason": f"HARD BLOCK: BUY in {market_structure}"
-                }
-        elif signal_type == "SELL":
-            if market_structure in ["BULLISH", "BULLISH_PULLBACK", "WEAK_BULLISH"]:
-                trend_blocked = True
-                filters_report["hard_trend_block"] = {
-                    "passed": False,
-                    "reason": f"HARD BLOCK: SELL in {market_structure}"
-                }
-
-        if not trend_blocked:
+        if is_reversal:
             filters_report["hard_trend_block"] = {
                 "passed": True,
-                "reason": f"Trend OK: {signal_type} in {market_structure}"
+                "reason": f"Reversal-confirmed {signal_type} — stale-trend block bypassed (multi-layer confirmation)"
             }
+        else:
+            if signal_type == "BUY":
+                if market_structure in ["BEARISH", "BEARISH_PULLBACK", "WEAK_BEARISH"]:
+                    trend_blocked = True
+                    filters_report["hard_trend_block"] = {
+                        "passed": False,
+                        "reason": f"HARD BLOCK: BUY in {market_structure}"
+                    }
+            elif signal_type == "SELL":
+                if market_structure in ["BULLISH", "BULLISH_PULLBACK", "WEAK_BULLISH"]:
+                    trend_blocked = True
+                    filters_report["hard_trend_block"] = {
+                        "passed": False,
+                        "reason": f"HARD BLOCK: SELL in {market_structure}"
+                    }
+
+            if not trend_blocked:
+                filters_report["hard_trend_block"] = {
+                    "passed": True,
+                    "reason": f"Trend OK: {signal_type} in {market_structure}"
+                }
 
         if signal_type == "BUY":
             structure_ok = market_structure not in ["BEARISH", "BEARISH_PULLBACK"]
@@ -143,7 +159,7 @@ class FilterManager:
                 # v5.1: trend-start entries happen mid-range by nature — the
                 # structure break IS the confirmation. Rising RSI 45-62 with
                 # bullish momentum passes (was: only <=45, which vetoed every
-                # early trend-start the v5.4 engine produces).
+                # early structure-break entry the v5.4 engine produces).
                 rsi_trend = (45 <= rsi <= 62) and (rsi_momentum > 0) and (price_momentum >= 0)
                 rsi_ok = rsi_predictive or rsi_sweet or rsi_early or rsi_trend
                 filters_report["rsi"] = {

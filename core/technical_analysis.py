@@ -14,6 +14,10 @@
 #      score chunks were sweep-only) -> signals only fired on late retracement
 #      setups. Added symmetric trend-follow scoring (momentum + RSI + MACD-hist
 #      + Fib zone) so aligned trends score on their own, early.
+# v5.4.1: fixed a cosmetic-but-annoying bug — the reasoning strings were
+#         joined with the LITERAL two characters backslash+n ("\\n") instead
+#         of an actual newline, so every "reason" field/log line came out as
+#         one run-on line with visible \n's in it. Now joined with "\n".
 
 import os
 from typing import Dict, Optional, Tuple, List
@@ -37,7 +41,7 @@ class TechnicalAnalyzer:
         self.pattern_recognizer = CandlestickPatternRecognizer()
         self.fakeout_detector = FakeoutDetector()
         logger.info(
-            f"TechnicalAnalyzer v5.4 | RSI: {self.rsi_buy_low}-{self.rsi_sell_high} | "
+            f"TechnicalAnalyzer v5.4.1 | RSI: {self.rsi_buy_low}-{self.rsi_sell_high} | "
             f"FIBONACCI + CONFLUENCE SCORING | Symmetric trend-follow scoring ON"
         )
 
@@ -461,7 +465,7 @@ class TechnicalAnalyzer:
                                 or live_reversal == "BUY_EARLY")
                 if not mom_confirms:
                     reasons.append(f"BLOCKED: Price {current_price:.2f} < 200 EMA — counter-trend BUY lacks momentum")
-                    return abs(score), "HOLD", "\\n".join(reasons)
+                    return abs(score), "HOLD", "\n".join(reasons)
                 reasons.append("Counter-trend BUY vs 200 EMA — momentum confirms (penalty -0.20)")
                 score -= 0.20
 
@@ -508,7 +512,7 @@ class TechnicalAnalyzer:
                                 or live_reversal == "SELL_EARLY")
                 if not mom_confirms:
                     reasons.append(f"BLOCKED: Price {current_price:.2f} > 200 EMA — counter-trend SELL lacks momentum")
-                    return abs(score), "HOLD", "\\n".join(reasons)
+                    return abs(score), "HOLD", "\n".join(reasons)
                 reasons.append("Counter-trend SELL vs 200 EMA — momentum confirms (penalty +0.20)")
                 score += 0.20
 
@@ -616,7 +620,7 @@ class TechnicalAnalyzer:
             elif score <= -0.60:
                 signal = "SELL"
 
-        return abs(score), signal, "\\n".join(reasons)
+        return abs(score), signal, "\n".join(reasons)
 
     def _calculate_levels(self, signal: str, df: pd.DataFrame, support: Optional[float], resistance: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         current_price = df["close"].iloc[-1]

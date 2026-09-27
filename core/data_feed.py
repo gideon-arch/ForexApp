@@ -76,14 +76,18 @@ class DataFeedManager:
                     logger.error(f"Binance fallback failed: {e}")
 
             # EURUSD fallback: Deriv -> Kraken
+            # BUG FIX: this used to pass the raw Deriv symbol ("frxEURUSD")
+            # straight to Kraken, which has no such pair — so the fallback
+            # always silently failed. Strip the "frx" prefix first.
             if "EUR" in pair.upper() and "deriv" in tried:
-                logger.warning(f"🔄 Deriv failed, trying Kraken for {pair}...")
+                kraken_fallback_pair = pair.upper().replace("FRX", "")
+                logger.warning(f"🔄 Deriv failed, trying Kraken for {kraken_fallback_pair}...")
                 try:
                     kraken_tf = self._deriv_to_kraken_tf(timeframe) if str(timeframe).isdigit() else timeframe
-                    df = await self._fetch_from_kraken(pair, kraken_tf)
+                    df = await self._fetch_from_kraken(kraken_fallback_pair, kraken_tf)
                     tried.append("kraken")
                     if df is not None:
-                        logger.info(f"✅ Kraken fallback succeeded for {pair}")
+                        logger.info(f"✅ Kraken fallback succeeded for {kraken_fallback_pair}")
                 except Exception as e:
                     logger.error(f"Kraken fallback failed: {e}")
 

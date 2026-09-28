@@ -3,6 +3,12 @@
 # v5.3: Removed parse_mode="HTML" (was crashing on '<' in hold reasons, e.g.
 #       "Confidence 0.58 < min 0.60" -> Telegram 400 "can't parse entities").
 #       All messages are plain text + emojis, so no formatting is lost.
+# v5.4.3: Price formatting was hardcoded to 2 decimal places (:,.2f) for
+#         EVERY asset. That's fine for BTCUSD (~84,796.10) but destroys
+#         precision for EURUSD (~1.14235) — entry/SL/TP all rounded to
+#         "1.14" and became visually identical in the Telegram message,
+#         even though the underlying numbers were distinct. Now the decimal
+#         count adapts to the price's magnitude (5dp under 50, 2dp above).
 
 import os
 import asyncio
@@ -58,7 +64,7 @@ class NotificationManager:
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_alert_time: Optional[datetime] = None
         self.min_alert_interval = 15
-        logger.info(f"NotificationManager v5.3 | Enabled: {self.enabled}")
+        logger.info(f"NotificationManager v5.4.3 | Enabled: {self.enabled}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -88,6 +94,16 @@ class NotificationManager:
             self.last_alert_time = datetime.utcnow()
         return success
 
+    def _price_decimals(self, price: float) -> int:
+        """
+        v5.4.3: pick decimal places from the price's own magnitude instead of
+        a hardcoded 2dp. Forex pairs like EURUSD (~1.xxxxx) need 5dp or the
+        entry/SL/TP — which can differ by only a few hundredths of a unit —
+        all round to the same displayed number. BTC/Gold-range prices (low
+        thousands and up) are fine at 2dp.
+        """
+        return 5 if abs(price) < 50 else 2
+
     def _format_alert_message(self, alert: SignalAlert) -> str:
         emoji_signal = "🟢 BUY" if alert.signal == "BUY" else "🔴 SELL"
         emoji_urgency = "🔥" if alert.urgency == "high" else "⚡" if alert.urgency == "normal" else "📡"
@@ -96,15 +112,19 @@ class NotificationManager:
         # Asset-specific emoji
         asset_emoji = "₿" if "BTC" in alert.pair.upper() else "📊"
 
+        entry_dp = self._price_decimals(alert.entry_price)
+        sl_dp = self._price_decimals(alert.stop_loss)
+        tp_dp = self._price_decimals(alert.take_profit)
+
         lines = [
             f"{emoji_urgency} {asset_emoji} AI SIGNAL{early_label}",
             f"━━━━━━━━━━━━━━━━━━━━━━━",
             f"📊 Asset: {alert.pair}",
             f"{emoji_signal}",
             f"",
-            f"🎯 ENTRY:  {alert.entry_price:,.2f}",
-            f"🛑 SL:     {alert.stop_loss:,.2f}",
-            f"💰 TP:     {alert.take_profit:,.2f}",
+            f"🎯 ENTRY:  {alert.entry_price:,.{entry_dp}f}",
+            f"🛑 SL:     {alert.stop_loss:,.{sl_dp}f}",
+            f"💰 TP:     {alert.take_profit:,.{tp_dp}f}",
             f"",
             f"Confidence: {min(alert.confidence, 1.0) * 100:.1f}%",
             f"Confluence: {alert.confluence_score:.2f}",
@@ -123,7 +143,7 @@ class NotificationManager:
                 lines.append(f"  {layer}: {sig} ({trend})")
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"🤖 AI Bot v5.3 | Multi-Timeframe | Morning Boost")
+        lines.append(f"🤖 AI Bot v5.4.3 | Multi-Timeframe | Morning Boost")
 
         return "\n".join(lines)
 

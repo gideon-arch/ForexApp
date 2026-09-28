@@ -604,13 +604,20 @@ class MultiTimeframeEngine:
 
         self.signal_tracker.record_signal(pair, trend_direction, setup_hash, entry_price)
 
+        # v5.4.3: decimals must scale with the price's own magnitude — a flat
+        # round(x, 2) is fine for BTCUSD (~84,796.10) but collapses EURUSD
+        # (~1.14235) so entry/SL/TP all display as "1.14". This is what's
+        # stored in Redis/the API response, independent of how Telegram
+        # formats it (see notifications.py's matching fix).
+        decimals = 5 if entry_price < 50 else 2
+
         return {
             "pair": pair,
             "signal": trend_direction,
             "confidence": round(combined, 3),
-            "entry_price": round(entry_price, 2),
-            "stop_loss": round(stop_loss, 2),
-            "take_profit": round(take_profit, 2),
+            "entry_price": round(entry_price, decimals),
+            "stop_loss": round(stop_loss, decimals),
+            "take_profit": round(take_profit, decimals),
             "reason": self._build_reason(analyses, trend_direction, combined,
                                          two_layer_mode=two_layer_mode, morning=morning,
                                          early_trend_start=early_trend_start,

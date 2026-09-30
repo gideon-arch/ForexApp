@@ -153,7 +153,7 @@ class MultiTimeframeEngine:
         self.reversal_min_score = float(os.getenv("REVERSAL_MIN_SCORE", "0.75"))
 
         logger.info(
-            f"MultiTimeframeEngine v5.4.1 | Min confidence: {self.min_confidence} | "
+            f"MultiTimeframeEngine v5.4.6 | Min confidence: {self.min_confidence} | "
             f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
             f"2-layer fallback: {self.allow_two_layer} (score>={self.two_layer_min_score}, primary must agree) | "
             f"Early trend-start layer: ON | Reversal override: ON (score>={self.reversal_min_score}) | "
@@ -444,6 +444,21 @@ class MultiTimeframeEngine:
         entry_confidence = 0.0
         early_entry = False
 
+        # v5.4.6 BUG FIX: entry.smc_suggested_signal can be "HOLD" while
+        # entry.market_structure is already flatly opposite the trade (e.g.
+        # a BUY with entry market_structure == "BEARISH"). The EMA9/21 cross
+        # detector used below runs completely separate math from the
+        # structure/confluence calc and was firing without ever checking
+        # this — letting a BUY through while the entry timeframe's own
+        # trend reading had already flipped bearish (confirmed case: XAUUSD
+        # BUY fired with entry: HOLD (BEARISH) + a RANGE_WHIPSAW fakeout at
+        # 60% risk on the same cycle — price kept falling straight through
+        # both entry and stop-loss).
+        entry_structure_opposes = entry.get("market_structure") in (
+            ["BEARISH", "BEARISH_PULLBACK", "WEAK_BEARISH"] if trend_direction == "BUY"
+            else ["BULLISH", "BULLISH_PULLBACK", "WEAK_BULLISH"]
+        )
+
         if entry_signal == trend_direction and entry_score >= 0.30:
             entry_confirms = True
             entry_confidence = entry_score
@@ -466,6 +481,12 @@ class MultiTimeframeEngine:
                 entry_confirms = True
                 entry_confidence = early_start_score * 0.75
                 early_entry = True
+            elif entry_structure_opposes:
+                logger.info(
+                    f"{pair} early-entry EMA catch SKIPPED: entry market_structure "
+                    f"({entry.get('market_structure')}) opposes {trend_direction} — "
+                    f"not letting a fast EMA cross override the entry TF's own trend read"
+                )
             else:
                 # v5.4: trend running but entry layer quiet — catch it NOW via
                 # EMA cross + structure break instead of waiting for a candle
@@ -486,7 +507,7 @@ class MultiTimeframeEngine:
         two_layer_mode = False
         if not entry_confirms:
             opposite = "SELL" if trend_direction == "BUY" else "BUY"
-            entry_opposes = (entry_signal == opposite)
+            entry_opposes = (entry_signal == opposite) or entry_structure_opposes
             primary_actively_agrees = (
                 primary_signal == trend_direction
                 or primary_trend in ["BULLISH", "BEARISH"]

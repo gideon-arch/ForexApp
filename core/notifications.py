@@ -13,6 +13,7 @@
 import os
 import asyncio
 import aiohttp
+import html as html_lib
 from datetime import datetime
 from typing import Optional, Dict
 import logging
@@ -64,7 +65,7 @@ class NotificationManager:
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_alert_time: Optional[datetime] = None
         self.min_alert_interval = 15
-        logger.info(f"NotificationManager v5.4.3 | Enabled: {self.enabled}")
+        logger.info(f"NotificationManager v5.4.5 | Enabled: {self.enabled}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -89,7 +90,7 @@ class NotificationManager:
                 return False
 
         message = self._format_alert_message(alert)
-        success = await self._send_telegram_message(message)
+        success = await self._send_telegram_message(message, parse_mode="HTML")
         if success:
             self.last_alert_time = datetime.utcnow()
         return success
@@ -105,6 +106,19 @@ class NotificationManager:
         return 5 if abs(price) < 50 else 2
 
     def _format_alert_message(self, alert: SignalAlert) -> str:
+        """
+        v5.4.5: Entry/SL/TP are now wrapped in HTML <code> tags. On Telegram
+        mobile, tapping monospaced text copies just that value — so the user
+        can tap the SL number alone and paste it straight into MT5's Stop
+        Loss field, instead of having to select it out of the whole message.
+        This alert (unlike send_test_message, used for the summary/startup
+        messages) is safe to send as parse_mode=HTML because every piece of
+        dynamic text below is HTML-escaped first — that's what avoids the
+        original v5.3 crash, where a raw "<" in a hold-reason string like
+        "Confidence 0.58 < min 0.60" broke Telegram's HTML parser. The
+        summary/startup messages still go out as plain text for that same
+        reason (they DO contain raw "<" from filter comparisons).
+        """
         emoji_signal = "🟢 BUY" if alert.signal == "BUY" else "🔴 SELL"
         emoji_urgency = "🔥" if alert.urgency == "high" else "⚡" if alert.urgency == "normal" else "📡"
         early_label = " [EARLY]" if alert.is_early else ""
@@ -116,22 +130,24 @@ class NotificationManager:
         sl_dp = self._price_decimals(alert.stop_loss)
         tp_dp = self._price_decimals(alert.take_profit)
 
+        esc = lambda s: html_lib.escape(str(s), quote=False)
+
         lines = [
             f"{emoji_urgency} {asset_emoji} AI SIGNAL{early_label}",
             f"━━━━━━━━━━━━━━━━━━━━━━━",
-            f"📊 Asset: {alert.pair}",
+            f"📊 Asset: {esc(alert.pair)}",
             f"{emoji_signal}",
             f"",
-            f"🎯 ENTRY:  {alert.entry_price:,.{entry_dp}f}",
-            f"🛑 SL:     {alert.stop_loss:,.{sl_dp}f}",
-            f"💰 TP:     {alert.take_profit:,.{tp_dp}f}",
+            f"🎯 ENTRY:  <code>{alert.entry_price:,.{entry_dp}f}</code>",
+            f"🛑 SL:     <code>{alert.stop_loss:,.{sl_dp}f}</code>",
+            f"💰 TP:     <code>{alert.take_profit:,.{tp_dp}f}</code>",
             f"",
             f"Confidence: {min(alert.confidence, 1.0) * 100:.1f}%",
             f"Confluence: {alert.confluence_score:.2f}",
             f"⏰ Time: {alert.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
             f"━━━━━━━━━━━━━━━━━━━━━━━",
             f"🧠 Analysis:",
-            f"{alert.reasoning}",
+            f"{esc(alert.reasoning)}",
         ]
 
         if alert.layers:
@@ -140,25 +156,30 @@ class NotificationManager:
             for layer, data in alert.layers.items():
                 sig = data.get("signal", "HOLD")
                 trend = data.get("trend", "?")
-                lines.append(f"  {layer}: {sig} ({trend})")
+                lines.append(f"  {esc(layer)}: {esc(sig)} ({esc(trend)})")
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"🤖 AI Bot v5.4.3 | Multi-Timeframe | Morning Boost")
+        lines.append(f"🤖 AI Bot v5.4.5 | Multi-Timeframe | Morning Boost")
+        lines.append(f"👆 Tap a price above to copy it")
 
         return "\n".join(lines)
 
-    async def _send_telegram_message(self, message: str) -> bool:
+    async def _send_telegram_message(self, message: str, parse_mode: Optional[str] = None) -> bool:
         if not self.bot_token or not self.chat_id:
             return False
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        # v5.3: NO parse_mode — plain text. HTML mode crashed on '<' characters
-        # in hold reasons (e.g. "Confidence 0.58 < min 0.60").
+        # v5.3: summary/startup messages (send_test_message) stay plain text —
+        # HTML mode crashed on a raw '<' in hold reasons like
+        # "Confidence 0.58 < min 0.60". Signal alerts now opt into HTML
+        # (see send_telegram_alert) since their dynamic text is escaped.
         payload = {
             "chat_id": self.chat_id,
             "text": message,
             "disable_web_page_preview": True
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
 
         try:
             session = await self._get_session()

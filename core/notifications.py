@@ -65,7 +65,7 @@ class NotificationManager:
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_alert_time: Optional[datetime] = None
         self.min_alert_interval = 15
-        logger.info(f"NotificationManager v5.4.5 | Enabled: {self.enabled}")
+        logger.info(f"NotificationManager v5.4.7 | Enabled: {self.enabled}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -159,7 +159,7 @@ class NotificationManager:
                 lines.append(f"  {esc(layer)}: {esc(sig)} ({esc(trend)})")
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"🤖 AI Bot v5.4.5 | Multi-Timeframe | Morning Boost")
+        lines.append(f"🤖 AI Bot v5.4.7 | Multi-Timeframe | Morning Boost")
         lines.append(f"👆 Tap a price above to copy it")
 
         return "\n".join(lines)

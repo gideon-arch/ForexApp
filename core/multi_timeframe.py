@@ -153,7 +153,7 @@ class MultiTimeframeEngine:
         self.reversal_min_score = float(os.getenv("REVERSAL_MIN_SCORE", "0.75"))
 
         logger.info(
-            f"MultiTimeframeEngine v5.4.6 | Min confidence: {self.min_confidence} | "
+            f"MultiTimeframeEngine v5.4.7 | Min confidence: {self.min_confidence} | "
             f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
             f"2-layer fallback: {self.allow_two_layer} (score>={self.two_layer_min_score}, primary must agree) | "
             f"Early trend-start layer: ON | Reversal override: ON (score>={self.reversal_min_score}) | "
@@ -459,21 +459,54 @@ class MultiTimeframeEngine:
             else ["BULLISH", "BULLISH_PULLBACK", "WEAK_BULLISH"]
         )
 
+        # v5.4.7 BUG FIX: a "*_PULLBACK" primary_trend is the code's OWN
+        # label for "macro trend is this direction, but the recent swing
+        # structure has already turned the other way" (see
+        # _find_market_structure). That is not a green light to enter NOW —
+        # it's an active warning that a reversal may already be underway.
+        # Confirmed case: BTCUSD fired a 99%-confidence BUY with primary
+        # "HOLD (BULLISH_PULLBACK)", confirmed ONLY by a single-candle wick
+        # pattern on the entry chart ("LIVE: Bullish reversal, score 0.60")
+        # — price kept falling through both entry and stop-loss within the
+        # hour. Same thing happened on XAUUSD the same cycle. During a
+        # pullback state, only genuine entry-timeframe confluence agreement
+        # (the first branch below) is accepted; the weaker single-signal
+        # confirmations (a reversal wick, one candlestick pattern, or a bare
+        # divergence) are disabled, since a pullback is exactly the moment
+        # those are most likely to be a headfake rather than real.
+        is_pullback_state = primary_trend.endswith("_PULLBACK")
+
         if entry_signal == trend_direction and entry_score >= 0.30:
             entry_confirms = True
             entry_confidence = entry_score
-        elif entry_live == f"{trend_direction}_EARLY":
+        elif entry_live == f"{trend_direction}_EARLY" and not is_pullback_state:
             entry_confirms = True
             entry_confidence = entry.get("live_reversal_score", 0.5)
-        elif entry_cs == trend_direction and entry_cs_conf >= 0.50:
+        elif entry_cs == trend_direction and entry_cs_conf >= 0.50 and not is_pullback_state:
             entry_confirms = True
             entry_confidence = entry_cs_conf
-        elif entry_score >= 0.20:
+        elif entry_score >= 0.20 and not is_pullback_state:
             div = entry.get("rsi_divergence", "NONE")
             expected_div = "BULLISH_DIV" if trend_direction == "BUY" else "BEARISH_DIV"
             if div == expected_div:
                 entry_confirms = True
                 entry_confidence = 0.40
+
+        if not entry_confirms and is_pullback_state:
+            logger.info(
+                f"{pair} PULLBACK STATE: {primary_trend} requires full entry-timeframe "
+                f"confluence (entry_signal={entry_signal}, score={entry_score:.2f}) — "
+                f"weaker single-signal confirmations disabled this cycle"
+            )
+            return {
+                "pair": pair, "signal": "HOLD",
+                "reason": f"Pullback state ({primary_trend}) — entry timeframe didn't "
+                           f"give full confluence confirmation, only weaker signals",
+                "volatility_passed": True,
+                "secondary_indicators": secondary,
+                "secondary_df": frames["secondary"],
+                "layers": self._summarize_layers(analyses)
+            }
 
         if not entry_confirms:
             if early_trend_start:

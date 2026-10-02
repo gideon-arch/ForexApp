@@ -1,4 +1,4 @@
-# main.py - AI Crypto Signal Bot v5.4.6
+# main.py - AI Crypto Signal Bot v5.4.7
 # Multi-Asset | Multi-Timeframe | /analyze endpoint for cron-job.org
 # BTCUSD (Kraken, Binance fallback): 15m -> 5m -> 1m
 # EURUSD (Kraken primary, Deriv fallback): 15m -> 5m -> 1m
@@ -8,7 +8,7 @@
 # v5.3: Summary send result logged properly + version bumps (2-layer quality
 #       gate lives in multi_timeframe.py)
 # v5.4.1: Reversal override (fixes stale-trend BUY/SELL lock) + Gold added
-# v5.4.6: EURUSD moved to Kraken-primary (was flaking on Deriv HTTP 520s;
+# v5.4.7: EURUSD moved to Kraken-primary (was flaking on Deriv HTTP 520s;
 #         Deriv is now just its fallback) + Deriv retry/backoff + Kraken
 #         PAXG/USD proxy fallback for gold when Deriv is unreachable
 
@@ -114,7 +114,7 @@ class CloudForexEngine:
         # ===== Summary heartbeat interval (hours) =====
         self.summary_interval_hours = float(os.getenv("SUMMARY_INTERVAL_HOURS", "8"))
 
-        # ===== v5.4.6: DIRECTION-REPEAT SUPPRESSION =====
+        # ===== v5.4.7: DIRECTION-REPEAT SUPPRESSION =====
         # User feedback: getting a fresh BUY alert every few minutes for the
         # same pair while the trend hasn't actually changed is noise, not
         # new information — and risks someone re-entering a trade they're
@@ -126,7 +126,7 @@ class CloudForexEngine:
         self.direction_hold_hours = float(os.getenv("DIRECTION_HOLD_HOURS", "2"))
         self.last_alert_direction: dict = {}  # {asset: {"direction": "BUY", "timestamp": datetime}}
 
-        logger.info("CloudForexEngine v5.4.6 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
+        logger.info("CloudForexEngine v5.4.7 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
 
     def _morning_active(self) -> bool:
         hour = datetime.utcnow().hour
@@ -135,13 +135,13 @@ class CloudForexEngine:
         return hour >= self.morning_start_utc or hour < self.morning_end_utc
 
     async def initialize(self):
-        logger.info("Initializing Engine v5.4.6...")
+        logger.info("Initializing Engine v5.4.7...")
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
 
             await self.notification_manager.send_test_message(
-                "🤖 AI Crypto Bot v5.4.6 is ONLINE!\n"
+                "🤖 AI Crypto Bot v5.4.7 is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Assets: BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken)\n"
                 "📐 15m → 5m → 1m for all\n"
@@ -149,9 +149,9 @@ class CloudForexEngine:
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.4.6: Reversal override fix (stale-trend BUY/SELL lock) "
+                "🆕 v5.4.7: Reversal override fix (stale-trend BUY/SELL lock) "
                 "+ EURUSD Kraken-fallback fix + Gold added\n"
-                "⚙️ Version: 5.4.6"
+                "⚙️ Version: 5.4.7"
             )
             logger.info("Startup message sent")
 
@@ -166,7 +166,7 @@ class CloudForexEngine:
                 }
 
             app_state['is_running'] = True
-            logger.info("Engine v5.4.6 ready!")
+            logger.info("Engine v5.4.7 ready!")
 
         except Exception as e:
             logger.error(f"Engine init failed: {e}")
@@ -174,7 +174,7 @@ class CloudForexEngine:
 
     async def _keep_alive_ping(self):
         """
-        v5.4.6 BUG FIX: this used to ping http://localhost:8000/health, which
+        v5.4.7 BUG FIX: this used to ping http://localhost:8000/health, which
         never leaves the container — Render's free-tier spin-down timer only
         resets on traffic hitting the PUBLIC URL through their edge/proxy, so
         a pure loopback call was invisible to it and did nothing to prevent
@@ -245,7 +245,7 @@ class CloudForexEngine:
         lines.append(f"🌅 Morning boost: {'ACTIVE' if morning else 'off'} "
                      f"({self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC)")
         lines.append(f"⏱️ Check cycle: {self._current_check_interval()}s | Summary every {self.summary_interval_hours:g}h")
-        lines.append("🤖 AI Bot v5.4.6")
+        lines.append("🤖 AI Bot v5.4.7")
 
         # v5.3: log the ACTUAL result instead of claiming success
         success = await self.notification_manager.send_test_message("\n".join(lines))
@@ -334,7 +334,7 @@ class CloudForexEngine:
                 logger.info(f"HEARTBEAT [{asset}] cycle complete | HOLD (low confidence)")
                 return {"asset": asset, "signal": "HOLD", "reason": f"Confidence {adjusted_confidence:.2%} too low"}
 
-            # ===== v5.4.6: DIRECTION-REPEAT GATE =====
+            # ===== v5.4.7: DIRECTION-REPEAT GATE =====
             # A flip to the opposite direction always goes through — that's
             # real new information. The SAME direction repeating is only
             # suppressed for direction_hold_hours; a flip resets the clock.
@@ -447,7 +447,7 @@ class CloudForexEngine:
             await self.notification_manager.close()
         if redis_client:
             await redis_client.close()
-        logger.info("Engine v5.4.6 stopped")
+        logger.info("Engine v5.4.7 stopped")
 
 
 @asynccontextmanager
@@ -462,7 +462,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD + XAUUSD",
-    version="5.4.6",
+    version="5.4.7",
     lifespan=lifespan
 )
 
@@ -481,7 +481,7 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "assets": assets,
-        "version": "5.4.6",
+        "version": "5.4.7",
         "mode": "Multi-Timeframe | Per-Asset Thresholds | Morning Boost | Reversal Override | Quality-Gated 2-Layer"
     }
 
@@ -493,7 +493,7 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "5.4.6",
+        "version": "5.4.7",
         "morning_boost_active": engine._morning_active(),
         "check_interval_seconds": engine._current_check_interval(),
         "assets": {

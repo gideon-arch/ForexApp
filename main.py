@@ -1,4 +1,4 @@
-# main.py - AI Crypto Signal Bot v5.5.1
+# main.py - AI Crypto Signal Bot v5.5.2
 # Multi-Asset | Multi-Timeframe | /analyze endpoint for cron-job.org
 # BTCUSD (Kraken, Binance fallback): 15m -> 5m -> 1m
 # EURUSD (Kraken primary, Deriv fallback): 15m -> 5m -> 1m
@@ -8,7 +8,7 @@
 # v5.3: Summary send result logged properly + version bumps (2-layer quality
 #       gate lives in multi_timeframe.py)
 # v5.4.1: Reversal override (fixes stale-trend BUY/SELL lock) + Gold added
-# v5.5.1: EURUSD moved to Kraken-primary (was flaking on Deriv HTTP 520s;
+# v5.5.2: EURUSD moved to Kraken-primary (was flaking on Deriv HTTP 520s;
 #         Deriv is now just its fallback) + Deriv retry/backoff + Kraken
 #         PAXG/USD proxy fallback for gold when Deriv is unreachable
 
@@ -56,6 +56,7 @@ class CloudForexEngine:
         self.assets_config = {
             "BTCUSD": {
                 "source": "kraken",
+                "market_24_7": True,  # crypto never closes
                 "timeframes": {
                     "primary":   {"tf": "15m", "deriv_granularity": 900},
                     "secondary": {"tf": "5m",  "deriv_granularity": 300},
@@ -66,6 +67,7 @@ class CloudForexEngine:
             },
             "EURUSD": {
                 "source": "kraken",
+                "market_24_7": False,  # standard forex hours — see _is_forex_market_closed
                 "timeframes": {
                     "primary":   {"tf": "15m", "deriv_granularity": 900},
                     "secondary": {"tf": "5m",  "deriv_granularity": 300},
@@ -83,6 +85,7 @@ class CloudForexEngine:
             "frxXAUUSD": {
                 "source": "deriv",
                 "display_name": "XAUUSD",
+                "market_24_7": False,  # standard metals hours — see _is_forex_market_closed
                 "timeframes": {
                     "primary":   {"tf": "15m", "deriv_granularity": 900},
                     "secondary": {"tf": "5m",  "deriv_granularity": 300},
@@ -116,7 +119,11 @@ class CloudForexEngine:
         # ===== Summary heartbeat interval (hours) =====
         self.summary_interval_hours = float(os.getenv("SUMMARY_INTERVAL_HOURS", "8"))
 
-        # ===== v5.5.1: DIRECTION-REPEAT SUPPRESSION =====
+        # ===== v5.5.2: FOREX/METALS MARKET HOURS =====
+        self.forex_close_hour_utc = int(os.getenv("FOREX_CLOSE_HOUR_UTC", "21"))  # Friday
+        self.forex_open_hour_utc = int(os.getenv("FOREX_OPEN_HOUR_UTC", "21"))   # Sunday
+
+        # ===== v5.5.2: DIRECTION-REPEAT SUPPRESSION =====
         # User feedback: getting a fresh BUY alert every few minutes for the
         # same pair while the trend hasn't actually changed is noise, not
         # new information — and risks someone re-entering a trade they're
@@ -128,7 +135,27 @@ class CloudForexEngine:
         self.direction_hold_hours = float(os.getenv("DIRECTION_HOLD_HOURS", "2"))
         self.last_alert_direction: dict = {}  # {asset: {"direction": "BUY", "timestamp": datetime}}
 
-        logger.info("CloudForexEngine v5.5.1 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
+        logger.info("CloudForexEngine v5.5.2 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
+
+    def _is_forex_market_closed(self) -> bool:
+        """
+        v5.5.2: EURUSD and XAUUSD aren't 24/7 like crypto — standard forex/
+        metals hours are Sunday ~21:00 UTC open through Friday ~21:00 UTC
+        close (brokers vary by an hour or so; tune via .env). Outside that
+        window the feed is stale/thin, which is exactly how a nonsense
+        signal got generated AND how the outcome tracker tried to resolve
+        a trade against flat weekend candles. BTCUSD is exempt — crypto
+        trades every day.
+        """
+        now = datetime.utcnow()
+        wd = now.weekday()  # Monday=0 ... Saturday=5, Sunday=6
+        if wd == 5:  # all day Saturday
+            return True
+        if wd == 4 and now.hour >= self.forex_close_hour_utc:  # Friday after close
+            return True
+        if wd == 6 and now.hour < self.forex_open_hour_utc:  # Sunday before open
+            return True
+        return False
 
     def _morning_active(self) -> bool:
         hour = datetime.utcnow().hour
@@ -137,13 +164,13 @@ class CloudForexEngine:
         return hour >= self.morning_start_utc or hour < self.morning_end_utc
 
     async def initialize(self):
-        logger.info("Initializing Engine v5.5.1...")
+        logger.info("Initializing Engine v5.5.2...")
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
 
             await self.notification_manager.send_test_message(
-                "🤖 AI Crypto Bot v5.5.1 is ONLINE!\n"
+                "🤖 AI Crypto Bot v5.5.2 is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Assets: BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken)\n"
                 "📐 15m → 5m → 1m for all\n"
@@ -151,9 +178,9 @@ class CloudForexEngine:
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.5.1: Reversal override fix (stale-trend BUY/SELL lock) "
+                "🆕 v5.5.2: Reversal override fix (stale-trend BUY/SELL lock) "
                 "+ EURUSD Kraken-fallback fix + Gold added\n"
-                "⚙️ Version: 5.5.1"
+                "⚙️ Version: 5.5.2"
             )
             logger.info("Startup message sent")
 
@@ -168,7 +195,7 @@ class CloudForexEngine:
                 }
 
             app_state['is_running'] = True
-            logger.info("Engine v5.5.1 ready!")
+            logger.info("Engine v5.5.2 ready!")
 
         except Exception as e:
             logger.error(f"Engine init failed: {e}")
@@ -176,7 +203,7 @@ class CloudForexEngine:
 
     async def _keep_alive_ping(self):
         """
-        v5.5.1 BUG FIX: this used to ping http://localhost:8000/health, which
+        v5.5.2 BUG FIX: this used to ping http://localhost:8000/health, which
         never leaves the container — Render's free-tier spin-down timer only
         resets on traffic hitting the PUBLIC URL through their edge/proxy, so
         a pure loopback call was invisible to it and did nothing to prevent
@@ -227,7 +254,9 @@ class CloudForexEngine:
         ]
         for asset, info in self.health.items():
             display = self.assets_config[asset].get("display_name", asset)
-            status_emoji = "🟢" if info['status'] == 'healthy' else "🟡" if info['status'] == 'initializing' else "🔴"
+            status_emoji = ("🟢" if info['status'] == 'healthy'
+                           else "🌙" if info['status'] == 'market_closed'
+                           else "🟡" if info['status'] == 'initializing' else "🔴")
             lines.append(f"{status_emoji} {display}: {info['status']} | Signals today: {info['signals_today']}")
 
             last_sig = info.get('last_signal')
@@ -247,7 +276,7 @@ class CloudForexEngine:
         lines.append(f"🌅 Morning boost: {'ACTIVE' if morning else 'off'} "
                      f"({self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC)")
         lines.append(f"⏱️ Check cycle: {self._current_check_interval()}s | Summary every {self.summary_interval_hours:g}h")
-        lines.append("🤖 AI Bot v5.5.1")
+        lines.append("🤖 AI Bot v5.5.2")
 
         # v5.3: log the ACTUAL result instead of claiming success
         success = await self.notification_manager.send_test_message("\n".join(lines))
@@ -265,6 +294,21 @@ class CloudForexEngine:
         cfg = self.assets_config[asset]
         start_time = asyncio.get_event_loop().time()
 
+        # ===== v5.5.2: MARKET HOURS GATE =====
+        # Skip BOTH new-signal analysis AND outcome-checking while a non-24/7
+        # market is closed. Deliberately skipping outcome checks too: a trade
+        # genuinely can't resolve over the weekend, so checking it against
+        # stale/frozen closed-market candles was producing bogus resolutions
+        # (confirmed case: a EURUSD trade got marked resolved while the
+        # market was shut). Checking resumes cleanly once the market reopens
+        # and real candles start flowing again.
+        if not cfg.get("market_24_7", True) and self._is_forex_market_closed():
+            self.health[asset]['status'] = 'market_closed'
+            self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+            self.health[asset]['last_hold_reason'] = "Market closed (forex/metals weekend)"
+            logger.info(f"HEARTBEAT [{asset}] cycle complete | MARKET CLOSED — skipping analysis + outcome checks")
+            return {"asset": asset, "signal": "HOLD", "reason": "Market closed (forex/metals weekend)"}
+
         try:
             result = await self.mtf_engine.analyze_asset(
                 pair=asset,
@@ -280,7 +324,7 @@ class CloudForexEngine:
                 logger.info(f"HEARTBEAT [{asset}] cycle complete | NO_DATA (fetch failed)")
                 return {"asset": asset, "signal": "NO_DATA", "reason": "Failed to fetch or analyze"}
 
-            # ===== v5.5.1: OUTCOME TRACKING =====
+            # ===== v5.5.2: OUTCOME TRACKING =====
             # Runs every cycle regardless of whether a NEW signal fires this
             # time — this is what resolves signals sent on PRIOR cycles.
             resolved = await self.outcome_tracker.check_outcomes(asset, result.get("secondary_df"))
@@ -343,7 +387,7 @@ class CloudForexEngine:
                 logger.info(f"HEARTBEAT [{asset}] cycle complete | HOLD (low confidence)")
                 return {"asset": asset, "signal": "HOLD", "reason": f"Confidence {adjusted_confidence:.2%} too low"}
 
-            # ===== v5.5.1: DIRECTION-REPEAT GATE =====
+            # ===== v5.5.2: DIRECTION-REPEAT GATE =====
             # A flip to the opposite direction always goes through — that's
             # real new information. The SAME direction repeating is only
             # suppressed for direction_hold_hours; a flip resets the clock.
@@ -453,7 +497,7 @@ class CloudForexEngine:
                 f"Opened: {record['opened_at'][11:16]} UTC | "
                 f"Closed: {record['closed_at'][11:16]} UTC\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🤖 AI Bot v5.5.1 | Outcome Tracker"
+                f"🤖 AI Bot v5.5.2 | Outcome Tracker"
             )
             await self.notification_manager.send_test_message(msg)
         except Exception as e:
@@ -487,7 +531,7 @@ class CloudForexEngine:
             await self.notification_manager.close()
         if redis_client:
             await redis_client.close()
-        logger.info("Engine v5.5.1 stopped")
+        logger.info("Engine v5.5.2 stopped")
 
 
 @asynccontextmanager
@@ -502,7 +546,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD + XAUUSD",
-    version="5.5.1",
+    version="5.5.2",
     lifespan=lifespan
 )
 
@@ -521,7 +565,7 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "assets": assets,
-        "version": "5.5.1",
+        "version": "5.5.2",
         "mode": "Multi-Timeframe | Per-Asset Thresholds | Morning Boost | Reversal Override | Quality-Gated 2-Layer"
     }
 
@@ -533,7 +577,7 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "5.5.1",
+        "version": "5.5.2",
         "morning_boost_active": engine._morning_active(),
         "check_interval_seconds": engine._current_check_interval(),
         "assets": {

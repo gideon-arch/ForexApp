@@ -40,6 +40,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# v5.5.4: single source of truth for the version string. Every user-visible
+# version display (Telegram startup/signal/outcome messages, /health, /)
+# reads from this constant instead of its own hardcoded copy — that
+# duplication is exactly what let the Telegram footer drift several
+# versions behind the rest of the bot, repeatedly.
+APP_VERSION = "5.5.4"
+
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
     redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
@@ -167,10 +174,10 @@ class CloudForexEngine:
         logger.info("Initializing Engine v5.5.3...")
         try:
             self.data_feed = DataFeedManager()
-            self.notification_manager = NotificationManager()
+            self.notification_manager = NotificationManager(version=APP_VERSION)
 
             await self.notification_manager.send_test_message(
-                "🤖 AI Crypto Bot v5.5.3 is ONLINE!\n"
+                "🤖 AI Crypto Bot v" + APP_VERSION + " is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Assets: BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken)\n"
                 "📐 15m → 5m → 1m for all\n"
@@ -180,7 +187,7 @@ class CloudForexEngine:
                 f"{self.summary_interval_hours:g}h\n"
                 "🆕 v5.5.3: Reversal override fix (stale-trend BUY/SELL lock) "
                 "+ EURUSD Kraken-fallback fix + Gold added\n"
-                "⚙️ Version: 5.5.3"
+                f"⚙️ Version: {APP_VERSION}"
             )
             logger.info("Startup message sent")
 
@@ -276,7 +283,7 @@ class CloudForexEngine:
         lines.append(f"🌅 Morning boost: {'ACTIVE' if morning else 'off'} "
                      f"({self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC)")
         lines.append(f"⏱️ Check cycle: {self._current_check_interval()}s | Summary every {self.summary_interval_hours:g}h")
-        lines.append("🤖 AI Bot v5.5.3")
+        lines.append(f"🤖 AI Bot v{APP_VERSION}")
 
         # v5.3: log the ACTUAL result instead of claiming success
         success = await self.notification_manager.send_test_message("\n".join(lines))
@@ -497,7 +504,7 @@ class CloudForexEngine:
                 f"Opened: {record['opened_at'][11:16]} UTC | "
                 f"Closed: {record['closed_at'][11:16]} UTC\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🤖 AI Bot v5.5.3 | Outcome Tracker"
+                f"🤖 AI Bot v{APP_VERSION} | Outcome Tracker"
             )
             await self.notification_manager.send_test_message(msg)
         except Exception as e:
@@ -546,7 +553,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD + XAUUSD",
-    version="5.5.3",
+    version=APP_VERSION,
     lifespan=lifespan
 )
 
@@ -565,7 +572,7 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "assets": assets,
-        "version": "5.5.3",
+        "version": APP_VERSION,
         "mode": "Multi-Timeframe | Per-Asset Thresholds | Morning Boost | Reversal Override | Quality-Gated 2-Layer"
     }
 
@@ -577,7 +584,7 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "5.5.3",
+        "version": APP_VERSION,
         "morning_boost_active": engine._morning_active(),
         "check_interval_seconds": engine._current_check_interval(),
         "assets": {

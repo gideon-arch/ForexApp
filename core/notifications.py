@@ -58,14 +58,25 @@ class SignalAlert:
 
 
 class NotificationManager:
-    def __init__(self):
+    def __init__(self, version: str = "unknown"):
+        """
+        v5.5.4 BUG FIX: the version shown in the Telegram footer was a
+        separate hardcoded string in THIS file, independent of the one in
+        main.py — so every version bump needed editing two files, and it
+        kept getting missed (confirmed repeatedly: footer showed v5.4.5,
+        then v5.5.1, while the rest of the bot was already several versions
+        ahead). `version` is now passed in from main.py's single
+        APP_VERSION constant at startup — there is nothing left to forget
+        to update here.
+        """
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         self.enabled = bool(self.bot_token and self.chat_id)
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_alert_time: Optional[datetime] = None
         self.min_alert_interval = 15
-        logger.info(f"NotificationManager v5.5.1 | Enabled: {self.enabled}")
+        self.version = version
+        logger.info(f"NotificationManager v{self.version} | Enabled: {self.enabled}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -159,7 +170,7 @@ class NotificationManager:
                 lines.append(f"  {esc(layer)}: {esc(sig)} ({esc(trend)})")
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"🤖 AI Bot v5.5.1 | Multi-Timeframe | Morning Boost")
+        lines.append(f"🤖 AI Bot v{self.version} | Multi-Timeframe | Morning Boost")
         lines.append(f"👆 Tap a price above to copy it")
 
         return "\n".join(lines)

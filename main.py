@@ -1,4 +1,4 @@
-# main.py - AI Crypto Signal Bot v5.4.7
+# main.py - AI Crypto Signal Bot v5.5.1
 # Multi-Asset | Multi-Timeframe | /analyze endpoint for cron-job.org
 # BTCUSD (Kraken, Binance fallback): 15m -> 5m -> 1m
 # EURUSD (Kraken primary, Deriv fallback): 15m -> 5m -> 1m
@@ -8,7 +8,7 @@
 # v5.3: Summary send result logged properly + version bumps (2-layer quality
 #       gate lives in multi_timeframe.py)
 # v5.4.1: Reversal override (fixes stale-trend BUY/SELL lock) + Gold added
-# v5.4.7: EURUSD moved to Kraken-primary (was flaking on Deriv HTTP 520s;
+# v5.5.1: EURUSD moved to Kraken-primary (was flaking on Deriv HTTP 520s;
 #         Deriv is now just its fallback) + Deriv retry/backoff + Kraken
 #         PAXG/USD proxy fallback for gold when Deriv is unreachable
 
@@ -31,6 +31,7 @@ from core.data_feed import DataFeedManager
 from core.multi_timeframe import MultiTimeframeEngine
 from core.filters import FilterManager
 from core.notifications import NotificationManager, SignalAlert
+from core.outcome_tracker import OutcomeTracker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +106,7 @@ class CloudForexEngine:
         self.notification_manager = None
         self.filter_managers = {}
         self.mtf_engine = MultiTimeframeEngine()
+        self.outcome_tracker = OutcomeTracker(redis_client)
 
         # ===== MORNING-BIRD: faster checks during the morning window =====
         self.morning_start_utc = int(os.getenv("MORNING_BOOST_START_UTC", "6"))
@@ -114,7 +116,7 @@ class CloudForexEngine:
         # ===== Summary heartbeat interval (hours) =====
         self.summary_interval_hours = float(os.getenv("SUMMARY_INTERVAL_HOURS", "8"))
 
-        # ===== v5.4.7: DIRECTION-REPEAT SUPPRESSION =====
+        # ===== v5.5.1: DIRECTION-REPEAT SUPPRESSION =====
         # User feedback: getting a fresh BUY alert every few minutes for the
         # same pair while the trend hasn't actually changed is noise, not
         # new information — and risks someone re-entering a trade they're
@@ -126,7 +128,7 @@ class CloudForexEngine:
         self.direction_hold_hours = float(os.getenv("DIRECTION_HOLD_HOURS", "2"))
         self.last_alert_direction: dict = {}  # {asset: {"direction": "BUY", "timestamp": datetime}}
 
-        logger.info("CloudForexEngine v5.4.7 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
+        logger.info("CloudForexEngine v5.5.1 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
 
     def _morning_active(self) -> bool:
         hour = datetime.utcnow().hour
@@ -135,13 +137,13 @@ class CloudForexEngine:
         return hour >= self.morning_start_utc or hour < self.morning_end_utc
 
     async def initialize(self):
-        logger.info("Initializing Engine v5.4.7...")
+        logger.info("Initializing Engine v5.5.1...")
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager()
 
             await self.notification_manager.send_test_message(
-                "🤖 AI Crypto Bot v5.4.7 is ONLINE!\n"
+                "🤖 AI Crypto Bot v5.5.1 is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Assets: BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken)\n"
                 "📐 15m → 5m → 1m for all\n"
@@ -149,9 +151,9 @@ class CloudForexEngine:
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.4.7: Reversal override fix (stale-trend BUY/SELL lock) "
+                "🆕 v5.5.1: Reversal override fix (stale-trend BUY/SELL lock) "
                 "+ EURUSD Kraken-fallback fix + Gold added\n"
-                "⚙️ Version: 5.4.7"
+                "⚙️ Version: 5.5.1"
             )
             logger.info("Startup message sent")
 
@@ -166,7 +168,7 @@ class CloudForexEngine:
                 }
 
             app_state['is_running'] = True
-            logger.info("Engine v5.4.7 ready!")
+            logger.info("Engine v5.5.1 ready!")
 
         except Exception as e:
             logger.error(f"Engine init failed: {e}")
@@ -174,7 +176,7 @@ class CloudForexEngine:
 
     async def _keep_alive_ping(self):
         """
-        v5.4.7 BUG FIX: this used to ping http://localhost:8000/health, which
+        v5.5.1 BUG FIX: this used to ping http://localhost:8000/health, which
         never leaves the container — Render's free-tier spin-down timer only
         resets on traffic hitting the PUBLIC URL through their edge/proxy, so
         a pure loopback call was invisible to it and did nothing to prevent
@@ -245,7 +247,7 @@ class CloudForexEngine:
         lines.append(f"🌅 Morning boost: {'ACTIVE' if morning else 'off'} "
                      f"({self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC)")
         lines.append(f"⏱️ Check cycle: {self._current_check_interval()}s | Summary every {self.summary_interval_hours:g}h")
-        lines.append("🤖 AI Bot v5.4.7")
+        lines.append("🤖 AI Bot v5.5.1")
 
         # v5.3: log the ACTUAL result instead of claiming success
         success = await self.notification_manager.send_test_message("\n".join(lines))
@@ -277,6 +279,13 @@ class CloudForexEngine:
                 self.health[asset]['last_check'] = asyncio.get_event_loop().time()
                 logger.info(f"HEARTBEAT [{asset}] cycle complete | NO_DATA (fetch failed)")
                 return {"asset": asset, "signal": "NO_DATA", "reason": "Failed to fetch or analyze"}
+
+            # ===== v5.5.1: OUTCOME TRACKING =====
+            # Runs every cycle regardless of whether a NEW signal fires this
+            # time — this is what resolves signals sent on PRIOR cycles.
+            resolved = await self.outcome_tracker.check_outcomes(asset, result.get("secondary_df"))
+            for record in resolved:
+                await self._send_outcome_notification(record)
 
             if result.get("signal") == "HOLD":
                 self.health[asset]['status'] = 'healthy'
@@ -334,7 +343,7 @@ class CloudForexEngine:
                 logger.info(f"HEARTBEAT [{asset}] cycle complete | HOLD (low confidence)")
                 return {"asset": asset, "signal": "HOLD", "reason": f"Confidence {adjusted_confidence:.2%} too low"}
 
-            # ===== v5.4.7: DIRECTION-REPEAT GATE =====
+            # ===== v5.5.1: DIRECTION-REPEAT GATE =====
             # A flip to the opposite direction always goes through — that's
             # real new information. The SAME direction repeating is only
             # suppressed for direction_hold_hours; a flip resets the clock.
@@ -397,6 +406,8 @@ class CloudForexEngine:
             if redis_client:
                 await redis_client.setex(f"signal:{asset}:current", 3600, json.dumps(signal_data))
 
+            await self.outcome_tracker.record_signal(signal_data)
+
             self.health[asset]['signals_today'] += 1
             self.health[asset]['last_signal'] = signal_data
             self.health[asset]['status'] = 'healthy'
@@ -418,6 +429,35 @@ class CloudForexEngine:
             self.health[asset]['status'] = 'error'
             self.health[asset]['last_check'] = asyncio.get_event_loop().time()
             return {"asset": asset, "signal": "ERROR", "reason": str(e)}
+
+    async def _send_outcome_notification(self, record: dict):
+        """Plain-text follow-up when a tracked signal resolves WIN/LOSS/EXPIRED."""
+        try:
+            status = record["status"]
+            if status == "EXPIRED":
+                emoji = "⌛"
+                result_line = f"EXPIRED — still open after {self.outcome_tracker.timeout_hours:g}h, no TP/SL hit"
+            elif status == "WIN":
+                emoji = "✅"
+                result_line = f"WIN — TP hit @ {record['close_price']:,.5f} ({record['r_multiple']:+.2f}R)"
+            else:
+                emoji = "❌"
+                result_line = f"LOSS — SL hit @ {record['close_price']:,.5f} ({record['r_multiple']:+.2f}R)"
+
+            msg = (
+                f"{emoji} SIGNAL RESOLVED\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 {record['display_name']} {record['direction']}\n"
+                f"Entry: {record['entry_price']:,.5f}\n"
+                f"{result_line}\n"
+                f"Opened: {record['opened_at'][11:16]} UTC | "
+                f"Closed: {record['closed_at'][11:16]} UTC\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 AI Bot v5.5.1 | Outcome Tracker"
+            )
+            await self.notification_manager.send_test_message(msg)
+        except Exception as e:
+            logger.error(f"Outcome notification error: {e}")
 
     async def monitor_asset(self, asset: str):
         cfg = self.assets_config[asset]
@@ -447,7 +487,7 @@ class CloudForexEngine:
             await self.notification_manager.close()
         if redis_client:
             await redis_client.close()
-        logger.info("Engine v5.4.7 stopped")
+        logger.info("Engine v5.5.1 stopped")
 
 
 @asynccontextmanager
@@ -462,7 +502,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Crypto Signal Bot",
     description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD + XAUUSD",
-    version="5.4.7",
+    version="5.5.1",
     lifespan=lifespan
 )
 
@@ -481,7 +521,7 @@ async def root():
     return {
         "status": "running" if app_state['is_running'] else "down",
         "assets": assets,
-        "version": "5.4.7",
+        "version": "5.5.1",
         "mode": "Multi-Timeframe | Per-Asset Thresholds | Morning Boost | Reversal Override | Quality-Gated 2-Layer"
     }
 
@@ -493,7 +533,7 @@ async def health_check():
         return {"status": "down", "error": "Engine not initialized"}
     return {
         "status": "healthy" if app_state['is_running'] else "down",
-        "version": "5.4.7",
+        "version": "5.5.1",
         "morning_boost_active": engine._morning_active(),
         "check_interval_seconds": engine._current_check_interval(),
         "assets": {
@@ -547,6 +587,21 @@ async def get_all_signals():
         if data:
             signals[asset] = json.loads(data)
     return signals
+
+
+@app.get("/api/stats")
+async def get_stats(asset: str = None):
+    """
+    Real win-rate / R-multiple stats from the outcome tracker — win_rate_pct,
+    avg_r_multiple, wins/losses/expired, overall and broken down per asset.
+    Pass ?asset=BTCUSD to scope to one pair.
+    """
+    engine = app_state.get('engine')
+    if not engine:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available — stats require Redis")
+    return await engine.outcome_tracker.get_stats(asset=asset)
 
 
 if __name__ == "__main__":

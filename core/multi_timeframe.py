@@ -137,8 +137,13 @@ class MultiTimeframeEngine:
         self.min_adx = float(os.getenv("MIN_ADX", "18"))
         self.min_atr_pct = float(os.getenv("MIN_ATR_PCT", "0.02"))
 
-        # ===== 2-LAYER FALLBACK =====
-        self.allow_two_layer = os.getenv("ALLOW_TWO_LAYER_FALLBACK", "true").lower() == "true"
+        # ===== 2-LAYER FALLBACK — REMOVED in v5.5.0 =====
+        # Kept as dead config (harmless if still set in .env) so an old
+        # TWO_LAYER_MIN_SCORE value doesn't error out — it's simply unused
+        # now. The fallback itself (firing with zero entry-timeframe
+        # confirmation) was cut entirely, not just tightened further; see
+        # the entry-confirmation block below for why.
+        self.allow_two_layer = False
         self.two_layer_min_score = float(os.getenv("TWO_LAYER_MIN_SCORE", "0.45"))
 
         # ===== MORNING-BIRD BOOST (times are UTC) =====
@@ -153,10 +158,11 @@ class MultiTimeframeEngine:
         self.reversal_min_score = float(os.getenv("REVERSAL_MIN_SCORE", "0.75"))
 
         logger.info(
-            f"MultiTimeframeEngine v5.4.7 | Min confidence: {self.min_confidence} | "
+            f"MultiTimeframeEngine v5.5.1 (SIMPLIFIED) | Min confidence: {self.min_confidence} | "
             f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
-            f"2-layer fallback: {self.allow_two_layer} (score>={self.two_layer_min_score}, primary must agree) | "
-            f"Early trend-start layer: ON | Reversal override: ON (score>={self.reversal_min_score}) | "
+            f"Entry confirmation: full-confluence OR early-trend-start ONLY | "
+            f"2-layer fallback: REMOVED | EMA-quiet-entry catch: REMOVED | "
+            f"Reversal override: ON (score>={self.reversal_min_score}) | "
             f"Morning boost: {self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC | "
             f"Per-asset overrides: supported"
         )
@@ -476,114 +482,81 @@ class MultiTimeframeEngine:
         # those are most likely to be a headfake rather than real.
         is_pullback_state = primary_trend.endswith("_PULLBACK")
 
-        if entry_signal == trend_direction and entry_score >= 0.30:
+        # ===== v5.5.0 SIMPLIFICATION =====
+        # Prior versions had SIX independent ways to satisfy "entry
+        # confirmed": full confluence, a live reversal wick, a candlestick
+        # pattern, a bare RSI divergence, an EMA9/21 catch when the entry
+        # layer was quiet, and a 2-layer fallback when entry didn't confirm
+        # at all. Each was added to catch one specific missed trade — but
+        # every extra door in is a door a weak setup can also walk through,
+        # and tracking real trade outcomes over two weeks showed a clearly
+        # negative track record concentrated in exactly these looser paths.
+        # More gates that only ever narrow things (pullback-state,
+        # entry-structure-opposition) are safe to keep layering on; more
+        # gates that each independently OPEN the trade are not — complexity
+        # there trades selectivity for coverage, and coverage is not what
+        # was missing.
+        #
+        # Now there are exactly TWO ways in:
+        #   1. Full confluence — entry's own suggested signal genuinely
+        #      agrees, with a real confluence score. This is the only
+        #      "standalone" trigger.
+        #   2. Genuine early-trend-start — primary hadn't labeled a trend
+        #      yet, entry broke structure, AND primary momentum (fast EMA21)
+        #      independently shifted. This isn't a weaker substitute for #1;
+        #      it's catching a trend at a different stage.
+        # A live reversal wick, a candlestick pattern, and RSI divergence
+        # are no longer standalone triggers — they're read as supporting
+        # context in the reasoning text, but they do not fire a trade alone.
+        # The 2-layer fallback (firing with NO entry-timeframe confirmation
+        # at all) is removed outright, not just tightened further.
+        # v5.5.1 BUG FIX: entry_structure_opposes was only ever wired into the
+        # fallback paths removed above — the "full confluence" branch below
+        # was never actually gated by it. That's a real gap: entry.smc_
+        # suggested_signal (confluence/sweep/pattern math) and entry.
+        # market_structure (EMA200+swing math) are two SEPARATE calculations
+        # on the same entry-timeframe data and can disagree with each other.
+        # Confirmed case: EURUSD fired a 92%-confidence SELL with Layer Check
+        # showing "entry: SELL (WEAK_BULLISH)" — the entry timeframe's own
+        # structure reading was already bullish-leaning while its confluence
+        # score still said SELL. Price reversed through the stop within the
+        # hour. Now a direct structure contradiction hard-blocks entry
+        # confirmation regardless of how clean the confluence score looks.
+        if entry_signal == trend_direction and entry_score >= 0.30 and not entry_structure_opposes:
             entry_confirms = True
             entry_confidence = entry_score
-        elif entry_live == f"{trend_direction}_EARLY" and not is_pullback_state:
+        elif early_trend_start:
+            # NOT gated by entry_structure_opposes: that label is the SAME
+            # kind of slower structure read this path exists to get ahead
+            # of — blocking it here would defeat the point of catching a
+            # reversal early.
+            # Entry confirmation = the structure break that started it all
             entry_confirms = True
-            entry_confidence = entry.get("live_reversal_score", 0.5)
-        elif entry_cs == trend_direction and entry_cs_conf >= 0.50 and not is_pullback_state:
-            entry_confirms = True
-            entry_confidence = entry_cs_conf
-        elif entry_score >= 0.20 and not is_pullback_state:
-            div = entry.get("rsi_divergence", "NONE")
-            expected_div = "BULLISH_DIV" if trend_direction == "BUY" else "BEARISH_DIV"
-            if div == expected_div:
-                entry_confirms = True
-                entry_confidence = 0.40
+            entry_confidence = early_start_score * 0.75
+            early_entry = True
 
-        if not entry_confirms and is_pullback_state:
-            logger.info(
-                f"{pair} PULLBACK STATE: {primary_trend} requires full entry-timeframe "
-                f"confluence (entry_signal={entry_signal}, score={entry_score:.2f}) — "
-                f"weaker single-signal confirmations disabled this cycle"
-            )
+        if not entry_confirms:
+            if is_pullback_state:
+                reason = (f"Pullback state ({primary_trend}) — entry timeframe didn't "
+                          f"give full confluence confirmation")
+            elif entry_structure_opposes:
+                reason = (f"Entry market_structure ({entry.get('market_structure')}) "
+                          f"opposes {trend_direction} — no confirmation path available")
+            else:
+                reason = (f"Entry timeframe not confirming (entry_signal={entry_signal}, "
+                          f"score={entry_score:.2f}) — 2-layer and EMA-catch fallbacks "
+                          f"removed in v5.5.0 simplification")
+            logger.info(f"{pair} HOLD: {reason}")
             return {
                 "pair": pair, "signal": "HOLD",
-                "reason": f"Pullback state ({primary_trend}) — entry timeframe didn't "
-                           f"give full confluence confirmation, only weaker signals",
+                "reason": reason,
                 "volatility_passed": True,
                 "secondary_indicators": secondary,
                 "secondary_df": frames["secondary"],
                 "layers": self._summarize_layers(analyses)
             }
 
-        if not entry_confirms:
-            if early_trend_start:
-                # Entry confirmation = the structure break that started it all
-                entry_confirms = True
-                entry_confidence = early_start_score * 0.75
-                early_entry = True
-            elif entry_structure_opposes:
-                logger.info(
-                    f"{pair} early-entry EMA catch SKIPPED: entry market_structure "
-                    f"({entry.get('market_structure')}) opposes {trend_direction} — "
-                    f"not letting a fast EMA cross override the entry TF's own trend read"
-                )
-            else:
-                # v5.4: trend running but entry layer quiet — catch it NOW via
-                # EMA cross + structure break instead of waiting for a candle
-                # pattern to confirm (that wait caused the 2h-late EURUSD SELL
-                # after the downtrend had already ended).
-                e_ok, e_score, e_reason = self._detect_early_trend(frames["entry"], trend_direction)
-                if e_ok:
-                    entry_confirms = True
-                    entry_confidence = e_score * 0.75  # penalty: unconfirmed
-                    early_entry = True
-                    logger.info(f"{pair} EARLY ENTRY [{trend_direction}]: {e_reason}")
-
-        # ===== 2-LAYER FALLBACK (v5.3 tightened) =====
-        # Direction + setup agree but entry layer is quiet. Fire ONLY when the
-        # primary layer actively agrees and the entry layer doesn't oppose.
-        # v5.1 lesson: primary "WEAK_BULLISH" with its own signal HOLD is a
-        # lean, not agreement — firing on it bought the top of a dump.
-        two_layer_mode = False
-        if not entry_confirms:
-            opposite = "SELL" if trend_direction == "BUY" else "BUY"
-            entry_opposes = (entry_signal == opposite) or entry_structure_opposes
-            primary_actively_agrees = (
-                primary_signal == trend_direction
-                or primary_trend in ["BULLISH", "BEARISH"]
-                or reversal_override
-            )
-
-            if entry_opposes:
-                return {
-                    "pair": pair, "signal": "HOLD",
-                    "reason": f"Entry layer opposes ({entry_signal}) — no 2-layer override",
-                    "volatility_passed": True,
-                    "secondary_indicators": secondary,
-                    "secondary_df": frames["secondary"],
-                    "layers": self._summarize_layers(analyses)
-                }
-
-            if (self.allow_two_layer
-                    and primary_actively_agrees
-                    and secondary_score >= eff_two_layer_score
-                    and secondary.get("fakeout_risk", 0) < 0.40):
-                entry_confirms = True
-                entry_confidence = 0.25
-                two_layer_mode = True
-                logger.info(f"{pair} 2-LAYER MODE: primary agrees ({primary_signal}/{primary_trend}), "
-                            f"entry quiet, setup score {secondary_score:.2f} — firing with penalty")
-            else:
-                why = []
-                if not self.allow_two_layer:
-                    why.append("fallback disabled")
-                if not primary_actively_agrees:
-                    why.append(f"primary not agreeing ({primary_signal}/{primary_trend})")
-                if secondary_score < eff_two_layer_score:
-                    why.append(f"setup score {secondary_score:.2f} < {eff_two_layer_score}")
-                if secondary.get("fakeout_risk", 0) >= 0.40:
-                    why.append("fakeout risk high")
-                return {
-                    "pair": pair, "signal": "HOLD",
-                    "reason": f"Entry timeframe not confirming ({'; '.join(why)})",
-                    "volatility_passed": True,
-                    "secondary_indicators": secondary,
-                    "secondary_df": frames["secondary"],
-                    "layers": self._summarize_layers(analyses)
-                }
+        two_layer_mode = False  # kept as a field for downstream code/notifications; always False now
 
         # ===== COMBINED CONFIDENCE =====
         primary_conf = primary.get("trend_strength", 0.5)

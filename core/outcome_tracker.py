@@ -33,7 +33,7 @@ class OutcomeTracker:
         self.timeout_hours = float(os.getenv("OUTCOME_TIMEOUT_HOURS", "48"))
         self.enabled = redis_client is not None
         logger.info(
-            f"OutcomeTracker v5.5.0 | Enabled: {self.enabled} | "
+            f"OutcomeTracker v5.5.3 | Enabled: {self.enabled} | "
             f"Timeout: {self.timeout_hours}h"
         )
 
@@ -158,10 +158,25 @@ class OutcomeTracker:
         await self.redis.lpush(self._closed_list_key(asset), signal_id)
         await self.redis.ltrim(self._closed_list_key(asset), 0, 499)  # keep last 500/asset
 
-    async def get_stats(self, asset: Optional[str] = None) -> Dict:
-        """Win rate / avg R, overall or for one asset."""
+    async def get_stats(self, asset: Optional[str] = None, since: Optional[str] = None) -> Dict:
+        """
+        Win rate / avg R, overall or for one asset.
+        `since`: optional ISO date/datetime string (e.g. "2026-10-04" or a
+        full timestamp). Only signals OPENED at or after this point count —
+        lets you mark "the bot stabilized here" and exclude earlier trades
+        from versions that have since been fixed, instead of them silently
+        dragging the win rate down forever.
+        """
         if not self.enabled:
             return {"enabled": False}
+
+        since_dt = None
+        if since:
+            try:
+                since_dt = pd.to_datetime(since)
+            except Exception:
+                return {"enabled": True, "error": f"Could not parse 'since' value: {since!r}. "
+                                                    f"Use a date like 2026-10-04 or a full ISO timestamp."}
 
         assets = [asset] if asset else await self._all_tracked_assets()
         per_asset = {}
@@ -173,12 +188,18 @@ class OutcomeTracker:
             for sid in ids:
                 raw = await self.redis.get(self._key(sid))
                 if raw:
-                    records.append(json.loads(raw))
+                    rec = json.loads(raw)
+                    if since_dt is not None and pd.to_datetime(rec["opened_at"]) < since_dt:
+                        continue
+                    records.append(rec)
             per_asset[a] = self._summarize(records)
             all_records.extend(records)
 
         overall = self._summarize(all_records)
-        return {"enabled": True, "overall": overall, "by_asset": per_asset}
+        result = {"enabled": True, "overall": overall, "by_asset": per_asset}
+        if since:
+            result["since"] = since
+        return result
 
     async def _all_tracked_assets(self) -> List[str]:
         assets = set()

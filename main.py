@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.5.4"
+APP_VERSION = "5.5.5"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:

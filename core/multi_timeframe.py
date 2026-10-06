@@ -158,7 +158,7 @@ class MultiTimeframeEngine:
         self.reversal_min_score = float(os.getenv("REVERSAL_MIN_SCORE", "0.75"))
 
         logger.info(
-            f"MultiTimeframeEngine v5.5.1 (SIMPLIFIED) | Min confidence: {self.min_confidence} | "
+            f"MultiTimeframeEngine v5.5.5 (SIMPLIFIED) | Min confidence: {self.min_confidence} | "
             f"Min ADX: {self.min_adx} | Min ATR%: {self.min_atr_pct}% | "
             f"Entry confirmation: full-confluence OR early-trend-start ONLY | "
             f"2-layer fallback: REMOVED | EMA-quiet-entry catch: REMOVED | "
@@ -628,6 +628,52 @@ class MultiTimeframeEngine:
             else:
                 stop_loss = entry_price + (atr * 1.5)
                 take_profit = entry_price - (atr * 3.0)
+
+        # ===== v5.5.5: FIXED-DOLLAR-RISK SL/TP =====
+        # User request: stop sizing SL/TP off ATR/support-resistance (which
+        # varies trade to trade) and instead fix them to a known dollar
+        # risk/reward at a known lot size — e.g. always $50 risk / $100
+        # reward at 0.5 lots. The 1:2 reward:risk the bot already enforces
+        # above is UNCHANGED — this only replaces the SL *distance*, and TP
+        # still follows at exactly 2x that distance, so $50 risk naturally
+        # becomes $100 reward without needing two separate numbers.
+        #
+        # SAFETY NOTE: this depends on each instrument's CONTRACT SIZE
+        # (units per 1.0 lot), which varies by broker/symbol and is NOT
+        # guaranteed to match the defaults below — verify in MT5 via
+        # Market Watch → right-click symbol → Specification → "Contract
+        # size" before trusting these numbers on a real account. Defaults
+        # here are common industry conventions, not confirmed Exness values
+        # for the "m"-suffixed (BTCUSDm/EURUSDm/XAUUSDm) symbol group.
+        if os.getenv("FIXED_DOLLAR_RISK_MODE", "true").lower() == "true":
+            target_risk_usd = float(os.getenv("TARGET_RISK_USD", "50"))
+            target_lot_size = float(os.getenv("TARGET_LOT_SIZE", "0.5"))
+            contract_sizes = {
+                "BTC": float(os.getenv("CONTRACT_SIZE_BTCUSD", "1")),        # 1 BTC/lot — VERIFY
+                "EUR": float(os.getenv("CONTRACT_SIZE_EURUSD", "100000")),   # 100k units/lot — VERIFY
+                "XAU": float(os.getenv("CONTRACT_SIZE_XAUUSD", "100")),      # 100 oz/lot — VERIFY
+            }
+            contract_size = None
+            for key, size in contract_sizes.items():
+                if key in pair.upper():
+                    contract_size = size
+                    break
+
+            if contract_size and target_lot_size > 0:
+                risk_distance = target_risk_usd / (contract_size * target_lot_size)
+                if trend_direction == "BUY":
+                    stop_loss = entry_price - risk_distance
+                    take_profit = entry_price + (risk_distance * 2)
+                else:
+                    stop_loss = entry_price + risk_distance
+                    take_profit = entry_price - (risk_distance * 2)
+                logger.info(
+                    f"{pair} FIXED-$ SIZING: risk ${target_risk_usd:.0f} / reward "
+                    f"${target_risk_usd*2:.0f} @ {target_lot_size} lot (contract={contract_size:g}) "
+                    f"-> SL distance {risk_distance:.5f}"
+                )
+            else:
+                logger.warning(f"{pair} FIXED-$ SIZING skipped — no contract size match, using ATR-based levels")
 
         self.signal_tracker.record_signal(pair, trend_direction, setup_hash, entry_price)
 

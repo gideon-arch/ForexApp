@@ -155,6 +155,14 @@ class NotificationManager:
             f"",
             f"Confidence: {min(alert.confidence, 1.0) * 100:.1f}%",
             f"Confluence: {alert.confluence_score:.2f}",
+        ]
+
+        if os.getenv("FIXED_DOLLAR_RISK_MODE", "true").lower() == "true":
+            target_risk = os.getenv("TARGET_RISK_USD", "50")
+            target_lot = os.getenv("TARGET_LOT_SIZE", "0.5")
+            lines.append(f"💵 Sized for: ${target_risk} risk / ${float(target_risk)*2:.0f} reward @ {target_lot} lot")
+
+        lines += [
             f"⏰ Time: {alert.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
             f"━━━━━━━━━━━━━━━━━━━━━━━",
             f"🧠 Analysis:",

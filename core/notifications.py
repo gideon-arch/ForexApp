@@ -26,7 +26,7 @@ class SignalAlert:
                  timestamp: datetime, reasoning: str, stop_loss: float,
                  take_profit: float, urgency: str = "normal",
                  is_early: bool = False, confluence_score: float = 0.0,
-                 layers: Optional[Dict] = None):
+                 layers: Optional[Dict] = None, signal_id: Optional[str] = None):
         self.pair = pair
         self.signal = signal
         self.entry_price = entry_price
@@ -39,6 +39,9 @@ class SignalAlert:
         self.is_early = is_early
         self.confluence_score = confluence_score
         self.layers = layers or {}
+        # v5.6.0: same ID the outcome tracker uses for this signal — lets the
+        # Accept/Reject button on this message reference the exact trade.
+        self.signal_id = signal_id
 
     def to_dict(self) -> Dict:
         return {
@@ -101,7 +104,21 @@ class NotificationManager:
                 return False
 
         message = self._format_alert_message(alert)
-        success = await self._send_telegram_message(message, parse_mode="HTML")
+
+        # v5.6.0: Accept/Reject buttons — only attached when the caller gave
+        # us a signal_id to reference. callback_data is capped at 64 bytes by
+        # Telegram; "acc_demo:" / "rej:" + signal_id comfortably fits typical
+        # IDs like "BTCUSD_2026-10-12T18:26:00.123456".
+        reply_markup = None
+        if alert.signal_id:
+            reply_markup = {
+                "inline_keyboard": [[
+                    {"text": "✅ Accept (Demo)", "callback_data": f"acc_demo:{alert.signal_id}"},
+                    {"text": "❌ Reject", "callback_data": f"rej:{alert.signal_id}"},
+                ]]
+            }
+
+        success = await self._send_telegram_message(message, parse_mode="HTML", reply_markup=reply_markup)
         if success:
             self.last_alert_time = datetime.utcnow()
         return success
@@ -183,7 +200,8 @@ class NotificationManager:
 
         return "\n".join(lines)
 
-    async def _send_telegram_message(self, message: str, parse_mode: Optional[str] = None) -> bool:
+    async def _send_telegram_message(self, message: str, parse_mode: Optional[str] = None,
+                                      reply_markup: Optional[Dict] = None) -> bool:
         if not self.bot_token or not self.chat_id:
             return False
 
@@ -199,6 +217,8 @@ class NotificationManager:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
 
         try:
             session = await self._get_session()
@@ -212,6 +232,69 @@ class NotificationManager:
                     return False
         except Exception as e:
             logger.error(f"Failed to send Telegram: {e}")
+            return False
+
+    async def set_webhook(self, webhook_url: str) -> bool:
+        """
+        v5.6.0: registers webhook_url with Telegram so button taps on
+        Accept/Reject get POSTed to our FastAPI app. Safe to call on every
+        startup — Telegram just re-confirms the same URL if unchanged.
+        """
+        if not self.bot_token:
+            return False
+        url = f"https://api.telegram.org/bot{self.bot_token}/setWebhook"
+        try:
+            session = await self._get_session()
+            async with session.post(url, json={"url": webhook_url}, timeout=10) as response:
+                data = await response.json()
+                if data.get("ok"):
+                    logger.info(f"Telegram webhook registered: {webhook_url}")
+                    return True
+                logger.error(f"Telegram setWebhook failed: {data}")
+                return False
+        except Exception as e:
+            logger.error(f"Telegram setWebhook error: {e}")
+            return False
+
+    async def answer_callback(self, callback_query_id: str, text: str = "") -> bool:
+        """Acknowledges a button tap — Telegram shows a loading spinner on the
+        button until this is called, and expects it within ~10s."""
+        if not self.bot_token:
+            return False
+        url = f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery"
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=payload, timeout=10) as response:
+                return response.status == 200
+        except Exception as e:
+            logger.error(f"Telegram answerCallbackQuery error: {e}")
+            return False
+
+    async def edit_message_reply_markup(self, chat_id, message_id: int, text: Optional[str] = None) -> bool:
+        """
+        After a button is tapped, replace the keyboard (and optionally the
+        text) so it's visually clear the tap registered — prevents double-taps
+        and confusion about whether the trade was actually accepted.
+        """
+        if not self.bot_token:
+            return False
+        try:
+            session = await self._get_session()
+            if text is not None:
+                url = f"https://api.telegram.org/bot{self.bot_token}/editMessageText"
+                payload = {"chat_id": chat_id, "message_id": message_id, "text": text,
+                           "parse_mode": "HTML"}
+            else:
+                url = f"https://api.telegram.org/bot{self.bot_token}/editMessageReplyMarkup"
+                payload = {"chat_id": chat_id, "message_id": message_id,
+                           "reply_markup": {"inline_keyboard": []}}
+            async with session.post(url, json=payload, timeout=10) as response:
+                return response.status == 200
+        except Exception as e:
+            logger.error(f"Telegram edit message error: {e}")
             return False
 
     async def close(self):

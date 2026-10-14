@@ -23,7 +23,7 @@ import json
 import logging
 import aiohttp
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.5.5"
+APP_VERSION = "5.6.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -417,19 +417,31 @@ class CloudForexEngine:
             urgency = 'high' if adjusted_confidence > 0.85 else 'normal' if adjusted_confidence > 0.60 else 'low'
 
             display_name = cfg.get("display_name", asset)
+
+            # v5.6.0: ONE shared timestamp for both the alert and the outcome
+            # record, so the signal_id the Accept/Reject button references
+            # (asset + this exact timestamp) is guaranteed to match the one
+            # outcome_tracker.record_signal derives below — two separate
+            # datetime.utcnow() calls could differ by microseconds and break
+            # the button's lookup.
+            signal_timestamp = datetime.utcnow()
+            signal_timestamp_iso = signal_timestamp.isoformat()
+            signal_id = f"{asset}_{signal_timestamp_iso}"
+
             alert = SignalAlert(
                 pair=display_name,
                 signal=signal_type,
                 entry_price=result["entry_price"],
                 confidence=adjusted_confidence,
-                timestamp=datetime.utcnow(),
+                timestamp=signal_timestamp,
                 reasoning=result["reason"],
                 stop_loss=result["stop_loss"],
                 take_profit=result["take_profit"],
                 urgency=urgency,
                 is_early=is_early,
                 confluence_score=result["confidence"],
-                layers=result.get("layers", {})
+                layers=result.get("layers", {}),
+                signal_id=signal_id
             )
 
             await self.notification_manager.send_telegram_alert(alert)
@@ -442,7 +454,7 @@ class CloudForexEngine:
                 "stop_loss": result["stop_loss"],
                 "take_profit": result["take_profit"],
                 "confidence": adjusted_confidence,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": signal_timestamp_iso,
                 "reason": result["reason"],
                 "is_early": is_early,
                 "reversal_override": is_reversal,
@@ -524,6 +536,14 @@ class CloudForexEngine:
 
     async def start(self):
         await self.initialize()
+        external_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+        if external_url and self.notification_manager.enabled:
+            await self.notification_manager.set_webhook(f"{external_url}/telegram/webhook")
+        else:
+            logger.warning(
+                "Skipping Telegram webhook registration (no RENDER_EXTERNAL_URL or "
+                "Telegram not configured) — Accept/Reject buttons won't work until this is set."
+            )
         asyncio.create_task(self._keep_alive_ping())
         asyncio.create_task(self._summary_heartbeat_loop())
         for asset in self.assets_config:
@@ -638,6 +658,138 @@ async def get_all_signals():
         if data:
             signals[asset] = json.loads(data)
     return signals
+
+
+# ===== v5.6.0: EXECUTION — Accept/Reject buttons + EA polling interface =====
+# Flow: signal fires -> Telegram message with Accept(Demo)/Reject buttons ->
+# tap hits /telegram/webhook -> on Accept, the trade is pushed onto a Redis
+# queue ("exec:queue:demo") -> your MQL5 EA polls GET /api/pending_trade via
+# WebRequest, pops the next one, places the order, then calls
+# POST /api/trade_executed to report back (you get a Telegram confirmation).
+# Nothing executes without an explicit Accept tap — Reject or silence both
+# mean no trade.
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    engine = app_state.get('engine')
+    if not engine:
+        return {"ok": True}  # ack anyway — nothing we can do, avoid Telegram retry storms
+
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    callback = update.get("callback_query")
+    if not callback:
+        return {"ok": True}  # not a button tap — ignore (e.g. a plain text message)
+
+    callback_id = callback.get("id", "")
+    data = callback.get("data", "")
+    message = callback.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+
+    try:
+        action, signal_id = data.split(":", 1)
+    except ValueError:
+        await engine.notification_manager.answer_callback(callback_id, "Unrecognized button")
+        return {"ok": True}
+
+    if action == "rej":
+        await engine.notification_manager.answer_callback(callback_id, "Rejected")
+        if chat_id and message_id:
+            await engine.notification_manager.edit_message_reply_markup(
+                chat_id, message_id, text=f"❌ Rejected — no trade placed.\n\n(signal: {signal_id})"
+            )
+        return {"ok": True}
+
+    if action == "acc_demo":
+        if not redis_client:
+            await engine.notification_manager.answer_callback(callback_id, "Redis unavailable — can't queue trade")
+            return {"ok": True}
+
+        raw = await redis_client.get(f"outcome:{signal_id}")
+        if not raw:
+            await engine.notification_manager.answer_callback(callback_id, "Signal expired or not found")
+            return {"ok": True}
+
+        record = json.loads(raw)
+        trade_payload = {
+            "signal_id": signal_id,
+            "asset": record["asset"],
+            "direction": record["direction"],
+            "entry_price": record["entry_price"],
+            "stop_loss": record["stop_loss"],
+            "take_profit": record["take_profit"],
+            "lot_size": float(os.getenv("TARGET_LOT_SIZE", "0.5")),
+            "account": "demo",
+            "queued_at": datetime.utcnow().isoformat(),
+        }
+        await redis_client.lpush("exec:queue:demo", json.dumps(trade_payload))
+        await engine.notification_manager.answer_callback(callback_id, "Accepted — queued for your EA")
+        if chat_id and message_id:
+            await engine.notification_manager.edit_message_reply_markup(
+                chat_id, message_id,
+                text=f"✅ Accepted (Demo) — queued for execution.\n\n(signal: {signal_id})"
+            )
+        logger.info(f"TRADE QUEUED [demo]: {signal_id}")
+        return {"ok": True}
+
+    await engine.notification_manager.answer_callback(callback_id, "Unknown action")
+    return {"ok": True}
+
+
+@app.get("/api/pending_trade")
+async def get_pending_trade(account: str = "demo"):
+    """
+    Polled by the MQL5 EA (via WebRequest) every few seconds. Pops and
+    returns the oldest queued, accepted trade for this account — or an
+    empty body if none. Popping (not just reading) means each trade is
+    handed out exactly once, so the EA doesn't need to track what it's
+    already seen.
+    """
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available")
+    raw = await redis_client.rpop(f"exec:queue:{account}")
+    if not raw:
+        return {}
+    return json.loads(raw)
+
+
+@app.post("/api/trade_executed")
+async def trade_executed(request: Request):
+    """
+    Called by the EA right after it places (or fails to place) an order, so
+    you get a Telegram confirmation instead of having to check MT5 yourself.
+    Expected JSON body: {signal_id, asset, direction, account, status
+    ("success"/"failed"), ticket (optional), lot_size (optional),
+    error (optional, if status=="failed")}
+    """
+    engine = app_state.get('engine')
+    body = await request.json()
+
+    signal_id = body.get("signal_id", "unknown")
+    status = body.get("status", "unknown")
+    asset = body.get("asset", "?")
+    direction = body.get("direction", "?")
+    account = body.get("account", "?")
+
+    if status == "success":
+        msg = (f"🤝 TRADE EXECUTED\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+               f"📊 {asset} {direction} | Account: {account}\n"
+               f"🎫 Ticket: {body.get('ticket', '?')} | Lot: {body.get('lot_size', '?')}\n"
+               f"(signal: {signal_id})")
+    else:
+        msg = (f"⚠️ TRADE EXECUTION FAILED\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+               f"📊 {asset} {direction} | Account: {account}\n"
+               f"Error: {body.get('error', 'unknown')}\n"
+               f"(signal: {signal_id})")
+
+    logger.info(f"EA REPORTED [{account}] {signal_id}: {status}")
+    if engine and engine.notification_manager:
+        await engine.notification_manager.send_test_message(msg)
+    return {"ok": True}
 
 
 @app.get("/api/stats")

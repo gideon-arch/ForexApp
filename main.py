@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.6.0"
+APP_VERSION = "5.6.1"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -748,13 +748,54 @@ async def get_pending_trade(account: str = "demo"):
     empty body if none. Popping (not just reading) means each trade is
     handed out exactly once, so the EA doesn't need to track what it's
     already seen.
+
+    v5.6.1 SAFEGUARD: an Accept tap queues SL/TP calculated around the
+    price AT THAT MOMENT. If the EA (laptop/MT5) isn't running to pick it
+    up right away — e.g. the laptop was off overnight — the market can
+    move far enough that those levels no longer make sense by the time it
+    finally executes. Confirmed case: an Oct 14 accepted trade sat queued
+    until the EA started running days later and fired against Oct 15's
+    price. Now anything older than EXEC_QUEUE_TIMEOUT_MINUTES (default 15)
+    is discarded instead of executed, with a Telegram notice so it's never
+    silent about why a trade you accepted never happened. Loops past
+    multiple stale entries in case several piled up while nothing was
+    polling.
     """
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available")
-    raw = await redis_client.rpop(f"exec:queue:{account}")
-    if not raw:
-        return {}
-    return json.loads(raw)
+
+    timeout_minutes = float(os.getenv("EXEC_QUEUE_TIMEOUT_MINUTES", "15"))
+    engine = app_state.get('engine')
+
+    while True:
+        raw = await redis_client.rpop(f"exec:queue:{account}")
+        if not raw:
+            return {}
+
+        trade = json.loads(raw)
+        queued_at = datetime.fromisoformat(trade["queued_at"])
+        age_minutes = (datetime.utcnow() - queued_at).total_seconds() / 60
+
+        if age_minutes <= timeout_minutes:
+            return trade
+
+        logger.warning(
+            f"EXPIRED TRADE DISCARDED [{account}]: {trade.get('signal_id')} "
+            f"was queued {age_minutes:.1f}m ago (limit {timeout_minutes:g}m) — not executing"
+        )
+        if engine and engine.notification_manager:
+            await engine.notification_manager.send_test_message(
+                f"⌛ ACCEPTED TRADE EXPIRED — NOT EXECUTED\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 {trade.get('asset', '?')} {trade.get('direction', '?')} | Account: {account}\n"
+                f"Queued {age_minutes:.0f} min ago — too stale to execute safely "
+                f"(limit {timeout_minutes:g} min). Market has likely moved.\n"
+                f"(signal: {trade.get('signal_id', '?')})\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Tip: only tap Accept when your laptop + MT5 + EA are on and "
+                f"about to pick it up — not for later."
+            )
+        # loop again — keep discarding stale entries until a fresh one or empty
 
 
 @app.post("/api/trade_executed")

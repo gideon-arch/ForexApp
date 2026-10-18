@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.6.1"
+APP_VERSION = "5.6.2"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -816,15 +816,25 @@ async def trade_executed(request: Request):
     direction = body.get("direction", "?")
     account = body.get("account", "?")
 
+    risk_usd = body.get("risk_usd")
+    balance = body.get("balance")
+    risk_line = ""
+    if risk_usd and balance:
+        risk_pct = (float(risk_usd) / float(balance) * 100) if float(balance) > 0 else 0
+        risk_line = f"💵 Risked: ${float(risk_usd):.2f} ({risk_pct:.1f}% of ${float(balance):.2f} balance)\n"
+
     if status == "success":
         msg = (f"🤝 TRADE EXECUTED\n━━━━━━━━━━━━━━━━━━━━━━━\n"
                f"📊 {asset} {direction} | Account: {account}\n"
                f"🎫 Ticket: {body.get('ticket', '?')} | Lot: {body.get('lot_size', '?')}\n"
+               f"{risk_line}"
                f"(signal: {signal_id})")
     else:
-        msg = (f"⚠️ TRADE EXECUTION FAILED\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg = (f"⚠️ TRADE {'SKIPPED' if 'Skipped' in str(body.get('error', '')) else 'EXECUTION FAILED'}\n"
+               f"━━━━━━━━━━━━━━━━━━━━━━━\n"
                f"📊 {asset} {direction} | Account: {account}\n"
-               f"Error: {body.get('error', 'unknown')}\n"
+               f"{risk_line}"
+               f"Reason: {body.get('error', 'unknown')}\n"
                f"(signal: {signal_id})")
 
     logger.info(f"EA REPORTED [{account}] {signal_id}: {status}")

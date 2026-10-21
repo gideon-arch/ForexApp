@@ -2,7 +2,6 @@
 # Multi-Asset | Multi-Timeframe | /analyze endpoint for cron-job.org
 # BTCUSD (Kraken, Binance fallback): 15m -> 5m -> 1m
 # EURUSD (Kraken primary, Deriv fallback): 15m -> 5m -> 1m
-# XAUUSD (Deriv primary w/ retry, Kraken PAXG/USD proxy fallback): 15m -> 5m -> 1m
 # v5.1: 8h Telegram summary + morning-bird checks + per-cycle log heartbeat
 # v5.2: PER-ASSET THRESHOLDS — EURUSD forex-calibrated gates
 # v5.3: Summary send result logged properly + version bumps (2-layer quality
@@ -45,7 +44,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.6.2"
+APP_VERSION = "5.6.5"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -142,7 +141,7 @@ class CloudForexEngine:
         self.direction_hold_hours = float(os.getenv("DIRECTION_HOLD_HOURS", "2"))
         self.last_alert_direction: dict = {}  # {asset: {"direction": "BUY", "timestamp": datetime}}
 
-        logger.info("CloudForexEngine v5.5.3 | BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken fallback) | Per-asset thresholds")
+        logger.info("CloudForexEngine v5.6.5 | BTCUSD + EURUSD + XAUUSD (all analyzed) | Telegram alerts: BTC only | Per-asset thresholds")
 
     def _is_forex_market_closed(self) -> bool:
         """
@@ -179,14 +178,14 @@ class CloudForexEngine:
             await self.notification_manager.send_test_message(
                 "🤖 AI Crypto Bot v" + APP_VERSION + " is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
-                "✅ Assets: BTCUSD (Kraken) + EURUSD + XAUUSD (Deriv/Kraken)\n"
+                "✅ Assets: BTCUSD + EURUSD + XAUUSD (all tracked) | 📵 Telegram alerts: BTC only\n"
                 "📐 15m → 5m → 1m for all\n"
                 "🎯 Exact Entry + TP + SL\n"
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
                 "🆕 v5.5.3: Reversal override fix (stale-trend BUY/SELL lock) "
-                "+ EURUSD Kraken-fallback fix + Gold added\n"
+                "+ EURUSD/Gold removed — BTC-only\n"
                 f"⚙️ Version: {APP_VERSION}"
             )
             logger.info("Startup message sent")
@@ -572,7 +571,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Crypto Signal Bot",
-    description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD + XAUUSD",
+    description="Multi-Asset Multi-Timeframe | BTCUSD + EURUSD + XAUUSD | Telegram: BTC only",
     version=APP_VERSION,
     lifespan=lifespan
 )

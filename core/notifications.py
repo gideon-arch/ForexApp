@@ -93,6 +93,16 @@ class NotificationManager:
         return await self._send_telegram_message(message)
 
     async def send_telegram_alert(self, alert: SignalAlert) -> bool:
+        # v5.6.5: Telegram alerts limited to BTC only, per request — EUR and
+        # Gold signal quality hasn't earned trust yet. The engine itself is
+        # UNCHANGED: it still analyzes and the outcome tracker still records
+        # all three pairs exactly as before, so EUR/Gold stats keep building
+        # in the background (check /api/stats any time) — they just don't
+        # reach your phone anymore.
+        if "BTC" not in alert.pair.upper():
+            logger.info(f"Telegram alert suppressed (BTC-only mode): {alert.pair} {alert.signal}")
+            return False
+
         if not self.enabled:
             logger.warning("Telegram not configured")
             return False

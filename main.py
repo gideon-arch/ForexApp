@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.6.5"
+APP_VERSION = "5.6.6"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -494,6 +494,16 @@ class CloudForexEngine:
 
     async def _send_outcome_notification(self, record: dict):
         """Plain-text follow-up when a tracked signal resolves WIN/LOSS/EXPIRED."""
+        # v5.6.6 BUG FIX: send_telegram_alert() (the NEW-signal path) was
+        # already BTC-only filtered in notifications.py, but this RESOLVED-
+        # outcome path calls send_test_message() directly — a separate,
+        # unfiltered route — so EUR/Gold win/loss messages kept slipping
+        # through even though new EUR/Gold signals were correctly silenced.
+        # Same filter, applied here too. EUR/Gold still track normally in
+        # the background either way — check /api/stats any time.
+        if "BTC" not in record.get("asset", "").upper():
+            logger.info(f"Outcome notification suppressed (BTC-only mode): {record.get('asset')} {record.get('status')}")
+            return
         try:
             status = record["status"]
             if status == "EXPIRED":

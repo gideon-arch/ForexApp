@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.6.6"
+APP_VERSION = "5.7.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -743,6 +743,56 @@ async def telegram_webhook(request: Request):
                 text=f"✅ Accepted (Demo) — queued for execution.\n\n(signal: {signal_id})"
             )
         logger.info(f"TRADE QUEUED [demo]: {signal_id}")
+        return {"ok": True}
+
+    if action == "acc_live":
+        # v5.7.0: HARD GATE — defaults to false. This is the ONLY thing
+        # standing between a button tap and a real-money order, so it must
+        # be a deliberate, separate action on your end (set
+        # LIVE_TRADING_ENABLED=true in Render's environment variables) —
+        # never something a code deploy alone can turn on.
+        if os.getenv("LIVE_TRADING_ENABLED", "false").lower() != "true":
+            await engine.notification_manager.answer_callback(
+                callback_id, "Live trading is NOT enabled on the server yet", show_alert=True
+            )
+            if chat_id and message_id:
+                await engine.notification_manager.edit_message_reply_markup(
+                    chat_id, message_id,
+                    text=f"⚠️ LIVE trading is not enabled on the server — nothing was queued.\n"
+                         f"Set LIVE_TRADING_ENABLED=true on Render when you're ready.\n\n(signal: {signal_id})"
+                )
+            logger.warning(f"LIVE ACCEPT BLOCKED (LIVE_TRADING_ENABLED off): {signal_id}")
+            return {"ok": True}
+
+        if not redis_client:
+            await engine.notification_manager.answer_callback(callback_id, "Redis unavailable — can't queue trade")
+            return {"ok": True}
+
+        raw = await redis_client.get(f"outcome:{signal_id}")
+        if not raw:
+            await engine.notification_manager.answer_callback(callback_id, "Signal expired or not found")
+            return {"ok": True}
+
+        record = json.loads(raw)
+        trade_payload = {
+            "signal_id": signal_id,
+            "asset": record["asset"],
+            "direction": record["direction"],
+            "entry_price": record["entry_price"],
+            "stop_loss": record["stop_loss"],
+            "take_profit": record["take_profit"],
+            "lot_size": float(os.getenv("TARGET_LOT_SIZE", "0.5")),  # EA recalculates this for real anyway
+            "account": "live",
+            "queued_at": datetime.utcnow().isoformat(),
+        }
+        await redis_client.lpush("exec:queue:live", json.dumps(trade_payload))
+        await engine.notification_manager.answer_callback(callback_id, "🔴 LIVE — accepted and queued", show_alert=True)
+        if chat_id and message_id:
+            await engine.notification_manager.edit_message_reply_markup(
+                chat_id, message_id,
+                text=f"🔴 Accepted (LIVE — real money) — queued for execution.\n\n(signal: {signal_id})"
+            )
+        logger.warning(f"TRADE QUEUED [LIVE]: {signal_id}")  # warning level — live queues should stand out in logs
         return {"ok": True}
 
     await engine.notification_manager.answer_callback(callback_id, "Unknown action")

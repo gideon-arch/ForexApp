@@ -119,13 +119,23 @@ class NotificationManager:
         # us a signal_id to reference. callback_data is capped at 64 bytes by
         # Telegram; "acc_demo:" / "rej:" + signal_id comfortably fits typical
         # IDs like "BTCUSD_2026-10-12T18:26:00.123456".
+        # v5.7.0: added a genuine Accept (Live) button — on its OWN row,
+        # separated from Demo/Reject, specifically so it's never the button
+        # your thumb lands on by habit. The server still hard-gates this
+        # behind LIVE_TRADING_ENABLED (default off) regardless of which
+        # button gets tapped — see the webhook handler in main.py.
         reply_markup = None
         if alert.signal_id:
             reply_markup = {
-                "inline_keyboard": [[
-                    {"text": "✅ Accept (Demo)", "callback_data": f"acc_demo:{alert.signal_id}"},
-                    {"text": "❌ Reject", "callback_data": f"rej:{alert.signal_id}"},
-                ]]
+                "inline_keyboard": [
+                    [
+                        {"text": "✅ Accept (Demo)", "callback_data": f"acc_demo:{alert.signal_id}"},
+                        {"text": "❌ Reject", "callback_data": f"rej:{alert.signal_id}"},
+                    ],
+                    [
+                        {"text": "🔴 Accept (LIVE — real money)", "callback_data": f"acc_live:{alert.signal_id}"},
+                    ],
+                ]
             }
 
         success = await self._send_telegram_message(message, parse_mode="HTML", reply_markup=reply_markup)
@@ -266,15 +276,19 @@ class NotificationManager:
             logger.error(f"Telegram setWebhook error: {e}")
             return False
 
-    async def answer_callback(self, callback_query_id: str, text: str = "") -> bool:
+    async def answer_callback(self, callback_query_id: str, text: str = "", show_alert: bool = False) -> bool:
         """Acknowledges a button tap — Telegram shows a loading spinner on the
-        button until this is called, and expects it within ~10s."""
+        button until this is called, and expects it within ~10s.
+        show_alert=True forces a real popup dialog instead of a brief toast —
+        used for live-trading accept/block so it can't be missed at a glance."""
         if not self.bot_token:
             return False
         url = f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery"
         payload = {"callback_query_id": callback_query_id}
         if text:
             payload["text"] = text
+        if show_alert:
+            payload["show_alert"] = True
         try:
             session = await self._get_session()
             async with session.post(url, json=payload, timeout=10) as response:

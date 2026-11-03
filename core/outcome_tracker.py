@@ -63,6 +63,7 @@ class OutcomeTracker:
                 "take_profit": signal_data["take_profit"],
                 "confidence": signal_data["confidence"],
                 "is_early": signal_data.get("is_early", False),
+                "context": signal_data.get("context") or {},
                 "opened_at": signal_data["timestamp"],
                 "status": "OPEN",
                 "closed_at": None,
@@ -158,7 +159,8 @@ class OutcomeTracker:
         await self.redis.lpush(self._closed_list_key(asset), signal_id)
         await self.redis.ltrim(self._closed_list_key(asset), 0, 499)  # keep last 500/asset
 
-    async def get_stats(self, asset: Optional[str] = None, since: Optional[str] = None) -> Dict:
+    async def get_stats(self, asset: Optional[str] = None, since: Optional[str] = None,
+                        breakdown: bool = False) -> Dict:
         """
         Win rate / avg R, overall or for one asset.
         `since`: optional ISO date/datetime string (e.g. "2026-10-04" or a
@@ -199,6 +201,8 @@ class OutcomeTracker:
         result = {"enabled": True, "overall": overall, "by_asset": per_asset}
         if since:
             result["since"] = since
+        if breakdown:
+            result["breakdown"] = self._breakdowns(all_records)
         return result
 
     async def _all_tracked_assets(self) -> List[str]:
@@ -233,4 +237,56 @@ class OutcomeTracker:
             "avg_r_multiple": avg_r,
             "avg_win_r": avg_win_r,
             "avg_loss_r": avg_loss_r,
+        }
+
+    def _slice(self, records: List[Dict], keyfn) -> Dict:
+        buckets: Dict[str, List[Dict]] = {}
+        for r in records:
+            if r.get("status") not in ("WIN", "LOSS"):
+                continue
+            buckets.setdefault(keyfn(r), []).append(r)
+        out = {}
+        for k in sorted(buckets):
+            s = self._summarize(buckets[k])
+            out[k] = {"n": s["total_closed"], "wins": s["wins"],
+                      "win_rate_pct": s["win_rate_pct"], "avg_r": s["avg_r_multiple"]}
+        return out
+
+    def _breakdowns(self, records: List[Dict]) -> Dict:
+        """
+        v5.8.0: win rate sliced by the features recorded when each signal
+        fired. Signals from before v5.8.0 have no context and land in the
+        "no_data" bucket, so they never get mixed into a yes/no comparison.
+        Small buckets (n under ~15) are noise — read them as hints, not facts.
+        """
+        NO = "no_data(old signal)"
+
+        def flag(name):
+            def f(r):
+                ctx = r.get("context") or {}
+                return NO if name not in ctx else ("yes" if ctx[name] else "no")
+            return f
+
+        def stop_vs_atr(r):
+            v = (r.get("context") or {}).get("sl_atr_ratio")
+            if v is None:
+                return NO
+            return "a) stop < 0.75x ATR" if v < 0.75 else ("b) 0.75-1.25x ATR" if v < 1.25 else "c) > 1.25x ATR")
+
+        def confidence(r):
+            c = r.get("confidence", 0) or 0
+            return "a) < 60%" if c < 0.60 else ("b) 60-80%" if c < 0.80 else "c) 80%+")
+
+        def session(r):
+            h = pd.to_datetime(r["opened_at"]).hour
+            return ("a) 00-08 UTC (Asia)" if h < 8 else "b) 08-13 UTC (Europe)" if h < 13
+                    else "c) 13-21 UTC (US)" if h < 21 else "d) 21-24 UTC (late)")
+
+        return {
+            "primary_layer_opposes_trade": self._slice(records, flag("primary_opposes")),
+            "range_chop_flagged": self._slice(records, flag("range_chop")),
+            "stop_size_vs_5m_ATR": self._slice(records, stop_vs_atr),
+            "displayed_confidence": self._slice(records, confidence),
+            "session": self._slice(records, session),
+            "direction": self._slice(records, lambda r: r.get("direction", "?")),
         }

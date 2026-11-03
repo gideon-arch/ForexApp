@@ -558,6 +558,34 @@ class MultiTimeframeEngine:
 
         two_layer_mode = False  # kept as a field for downstream code/notifications; always False now
 
+        # ===== v5.8.0: OPTIONAL NARROWING GATES (both OFF by default) =====
+        # Two patterns showed up in a 1-win/6-loss stretch: (a) trades taken
+        # AGAINST the 15m layer's own signal (primary said BUY on a SELL, and
+        # SELL on a BUY) and (b) signals fired inside range chop that the
+        # fakeout detector had already tagged RANGE_WHIPSAW. Neither is proven
+        # yet (tiny sample), so they only block when you switch them on in
+        # Render's env vars. Either way they are RECORDED on every signal
+        # (see _build_context), so /api/stats?breakdown=true can show whether
+        # these flags really lose more before you commit to blocking them.
+        # Both can only REMOVE trades, never add one.
+        primary_opposes = primary_signal in ("BUY", "SELL") and primary_signal != trend_direction
+        range_chop = secondary.get("fakeout_trap_type") == "RANGE_WHIPSAW"
+        gate_reason = None
+        if primary_opposes and os.getenv("BLOCK_PRIMARY_OPPOSITION", "false").lower() == "true":
+            gate_reason = f"15m layer's own signal ({primary_signal}) opposes this {trend_direction}"
+        elif range_chop and os.getenv("BLOCK_RANGE_WHIPSAW", "false").lower() == "true":
+            gate_reason = "Range-chop (whipsaw) detected on 5m"
+        if gate_reason:
+            logger.info(f"{pair} HOLD (optional gate): {gate_reason}")
+            return {
+                "pair": pair, "signal": "HOLD",
+                "reason": f"Blocked by optional gate: {gate_reason}",
+                "volatility_passed": True,
+                "secondary_indicators": secondary,
+                "secondary_df": frames["secondary"],
+                "layers": self._summarize_layers(analyses)
+            }
+
         # ===== COMBINED CONFIDENCE =====
         primary_conf = primary.get("trend_strength", 0.5)
         if primary_trend in ["BULLISH", "BEARISH"]:
@@ -712,7 +740,44 @@ class MultiTimeframeEngine:
             "early_entry": early_entry,
             "reversal_override": reversal_override,
             "morning_boost": morning,
-            "setup_hash": setup_hash
+            "setup_hash": setup_hash,
+            "context": self._build_context(
+                primary_signal=primary_signal, primary_trend=primary_trend,
+                secondary=secondary, secondary_signal=secondary_signal,
+                entry=entry, entry_signal=entry_signal,
+                trend_direction=trend_direction, entry_price=entry_price,
+                stop_loss=stop_loss, adx=adx,
+                reversal_override=reversal_override, early_trend_start=early_trend_start
+            )
+        }
+
+    def _build_context(self, *, primary_signal, primary_trend, secondary, secondary_signal,
+                       entry, entry_signal, trend_direction, entry_price, stop_loss, adx,
+                       reversal_override, early_trend_start) -> dict:
+        """
+        v5.8.0: snapshot of WHY this signal fired, stored with the outcome so
+        win rate can later be sliced by feature (/api/stats?breakdown=true)
+        instead of guessing which kind of signal is losing.
+        """
+        atr = float(secondary.get("atr", 0) or 0)
+        sl_distance = abs(float(entry_price) - float(stop_loss))
+        return {
+            "primary_signal": primary_signal,
+            "primary_trend": primary_trend,
+            "secondary_signal": secondary_signal,
+            "secondary_trend": secondary.get("market_structure"),
+            "entry_signal": entry_signal,
+            "entry_trend": entry.get("market_structure"),
+            "primary_opposes": bool(primary_signal in ("BUY", "SELL") and primary_signal != trend_direction),
+            "range_chop": bool(secondary.get("fakeout_trap_type") == "RANGE_WHIPSAW"),
+            "fakeout_trap": secondary.get("fakeout_trap_type"),
+            "fakeout_risk": round(float(secondary.get("fakeout_risk", 0) or 0), 2),
+            "atr": round(atr, 5),
+            "sl_distance": round(sl_distance, 5),
+            "sl_atr_ratio": round(sl_distance / atr, 2) if atr > 0 else None,
+            "adx": round(float(adx), 1),
+            "reversal_override": bool(reversal_override),
+            "early_trend_start": bool(early_trend_start),
         }
 
     def _summarize_layers(self, analyses: dict) -> dict:

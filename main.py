@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.7.0"
+APP_VERSION = "5.8.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -440,7 +440,8 @@ class CloudForexEngine:
                 is_early=is_early,
                 confluence_score=result["confidence"],
                 layers=result.get("layers", {}),
-                signal_id=signal_id
+                signal_id=signal_id,
+                extra_lines=self._context_lines(result.get("context", {}), signal_type)
             )
 
             await self.notification_manager.send_telegram_alert(alert)
@@ -462,7 +463,8 @@ class CloudForexEngine:
                 "atr_pct": result.get("atr_pct"),
                 "adx": result.get("adx"),
                 "layers": result.get("layers", {}),
-                "setup_hash": result.get("setup_hash")
+                "setup_hash": result.get("setup_hash"),
+                "context": result.get("context", {})
             }
 
             if redis_client:
@@ -491,6 +493,19 @@ class CloudForexEngine:
             self.health[asset]['status'] = 'error'
             self.health[asset]['last_check'] = asyncio.get_event_loop().time()
             return {"asset": asset, "signal": "ERROR", "reason": str(e)}
+
+    def _context_lines(self, ctx: dict, signal_type: str) -> list:
+        """v5.8.0: info/warning lines shown on the Telegram alert, built from the signal's recorded context."""
+        lines = []
+        dist, ratio = ctx.get("sl_distance"), ctx.get("sl_atr_ratio")
+        if dist and ratio is not None:
+            dist_txt = f"{dist:,.0f}" if dist >= 10 else f"{dist:.5f}"
+            lines.append(f"📏 Stop {dist_txt} pts = {ratio:.1f}x the 5m ATR (under 1.0x = noise can hit it)")
+        if ctx.get("primary_opposes"):
+            lines.append(f"⚠️ 15m layer's own signal is {ctx.get('primary_signal')} — AGAINST this {signal_type}")
+        if ctx.get("range_chop"):
+            lines.append("⚠️ Range chop (whipsaw) flagged — trend signals fail more often here")
+        return lines
 
     async def _send_outcome_notification(self, record: dict):
         """Plain-text follow-up when a tracked signal resolves WIN/LOSS/EXPIRED."""
@@ -903,7 +918,7 @@ async def trade_executed(request: Request):
 
 
 @app.get("/api/stats")
-async def get_stats(asset: str = None, since: str = None):
+async def get_stats(asset: str = None, since: str = None, breakdown: bool = False):
     """
     Real win-rate / R-multiple stats from the outcome tracker — win_rate_pct,
     avg_r_multiple, wins/losses/expired, overall and broken down per asset.
@@ -918,7 +933,7 @@ async def get_stats(asset: str = None, since: str = None):
         raise HTTPException(status_code=503, detail="Engine not initialized")
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available — stats require Redis")
-    return await engine.outcome_tracker.get_stats(asset=asset, since=since)
+    return await engine.outcome_tracker.get_stats(asset=asset, since=since, breakdown=breakdown)
 
 
 if __name__ == "__main__":

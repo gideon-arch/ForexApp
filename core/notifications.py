@@ -26,7 +26,8 @@ class SignalAlert:
                  timestamp: datetime, reasoning: str, stop_loss: float,
                  take_profit: float, urgency: str = "normal",
                  is_early: bool = False, confluence_score: float = 0.0,
-                 layers: Optional[Dict] = None, signal_id: Optional[str] = None):
+                 layers: Optional[Dict] = None, signal_id: Optional[str] = None,
+                 extra_lines: Optional[list] = None):
         self.pair = pair
         self.signal = signal
         self.entry_price = entry_price
@@ -42,6 +43,9 @@ class SignalAlert:
         # v5.6.0: same ID the outcome tracker uses for this signal — lets the
         # Accept/Reject button on this message reference the exact trade.
         self.signal_id = signal_id
+        # v5.8.0: short info/warning lines (stop size vs ATR, layer disagreement,
+        # range chop) composed by main.py from the signal's recorded context.
+        self.extra_lines = extra_lines or []
 
     def to_dict(self) -> Dict:
         return {
@@ -198,6 +202,9 @@ class NotificationManager:
             target_risk = os.getenv("TARGET_RISK_USD", "50")
             target_lot = os.getenv("TARGET_LOT_SIZE", "0.5")
             lines.append(f"💵 Sized for: ${target_risk} risk / ${float(target_risk)*2:.0f} reward @ {target_lot} lot")
+
+        for extra in alert.extra_lines:
+            lines.append(esc(extra))
 
         lines += [
             f"⏰ Time: {alert.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",

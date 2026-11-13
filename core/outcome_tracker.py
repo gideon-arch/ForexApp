@@ -282,7 +282,28 @@ class OutcomeTracker:
             return ("a) 00-08 UTC (Asia)" if h < 8 else "b) 08-13 UTC (Europe)" if h < 13
                     else "c) 13-21 UTC (US)" if h < 21 else "d) 21-24 UTC (late)")
 
+        def smc_flag(name):
+            def f(r):
+                smc = (r.get("context") or {}).get("smc") or {}
+                if not smc.get("available") or name not in smc:
+                    return NO
+                return "yes" if smc[name] else "no"
+            return f
+
+        def smc_count(r):
+            smc = (r.get("context") or {}).get("smc") or {}
+            if not smc.get("available"):
+                return NO
+            n = smc.get("confirmations", 0)
+            return "a) 0 of 4" if n == 0 else ("b) 1 of 4" if n == 1 else ("c) 2 of 4" if n == 2 else "d) 3-4 of 4"))
+
         return {
+            "smc_confirmations": self._slice(records, smc_count),
+            "in_order_block": self._slice(records, smc_flag("ob_aligned")),
+            "in_supply_demand_zone": self._slice(records, smc_flag("sd_aligned")),
+            "crt_aligned": self._slice(records, smc_flag("crt_aligned")),
+            "near_support_resistance": self._slice(records, smc_flag("sr_aligned")),
+            "opposing_zone_ahead": self._slice(records, smc_flag("obstacle_near")),
             "primary_layer_opposes_trade": self._slice(records, flag("primary_opposes")),
             "range_chop_flagged": self._slice(records, flag("range_chop")),
             "stop_size_vs_5m_ATR": self._slice(records, stop_vs_atr),

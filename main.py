@@ -31,6 +31,7 @@ from core.multi_timeframe import MultiTimeframeEngine
 from core.filters import FilterManager
 from core.notifications import NotificationManager, SignalAlert
 from core.outcome_tracker import OutcomeTracker
+from core.news_gate import NewsGate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +45,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.8.0"
+APP_VERSION = "5.9.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -116,6 +117,7 @@ class CloudForexEngine:
         self.filter_managers = {}
         self.mtf_engine = MultiTimeframeEngine()
         self.outcome_tracker = OutcomeTracker(redis_client)
+        self.news_gate = NewsGate(redis_client)
 
         # ===== MORNING-BIRD: faster checks during the morning window =====
         self.morning_start_utc = int(os.getenv("MORNING_BOOST_START_UTC", "6"))
@@ -174,6 +176,11 @@ class CloudForexEngine:
         try:
             self.data_feed = DataFeedManager()
             self.notification_manager = NotificationManager(version=APP_VERSION)
+            try:
+                await self.news_gate.load_cached()
+                await self.news_gate.refresh(force=True)
+            except Exception as e:
+                logger.error(f"News gate startup load failed (non-fatal): {e}")
 
             await self.notification_manager.send_test_message(
                 "🤖 AI Crypto Bot v" + APP_VERSION + " is ONLINE!\n"
@@ -241,6 +248,27 @@ class CloudForexEngine:
                 await asyncio.sleep(60)
 
     # ===== SUMMARY HEARTBEAT (Telegram, every N hours) =====
+    async def _news_loop(self):
+        """v5.9.0: keeps the calendar fresh and sends each news notice exactly once."""
+        await asyncio.sleep(20)
+        warned_at = None
+        while app_state['is_running']:
+            try:
+                await self.news_gate.refresh()
+                now = datetime.utcnow()
+                st = self.news_gate.status()
+                if st["enabled"] and not st["data_ok"]:
+                    if warned_at is None or (now - warned_at).total_seconds() > 6 * 3600:
+                        warned_at = now
+                        await self.notification_manager.send_test_message("⚠️ NEWS CALENDAR UNAVAILABLE\n" + st["reason"])
+                else:
+                    warned_at = None
+                for text in await self.news_gate.pop_due_notices():
+                    await self.notification_manager.send_test_message(text)
+            except Exception as e:
+                logger.error(f"News loop error: {e}")
+            await asyncio.sleep(30)
+
     async def _summary_heartbeat_loop(self):
         """Sends a status summary to Telegram every SUMMARY_INTERVAL_HOURS."""
         await asyncio.sleep(120)  # first summary ~2 min after startup msg
@@ -279,6 +307,7 @@ class CloudForexEngine:
                     lines.append("   Watching: no data yet")
 
         lines.append("━━━━━━━━━━━━━━━━━━━")
+        lines.append(self.news_gate.summary_line())
         lines.append(f"🌅 Morning boost: {'ACTIVE' if morning else 'off'} "
                      f"({self.morning_start_utc}:00-{self.morning_end_utc}:00 UTC)")
         lines.append(f"⏱️ Check cycle: {self._current_check_interval()}s | Summary every {self.summary_interval_hours:g}h")
@@ -350,6 +379,16 @@ class CloudForexEngine:
                     "volatility_passed": result.get("volatility_passed", False),
                     "layers": result.get("layers", {})
                 }
+
+            # v5.9.0: NEWS BLACKOUT — no new signal while a USD red-folder event is
+            # near or active (prop-firm rule). Analysis and outcome tracking carry on.
+            news = self.news_gate.status()
+            if news["no_new_trades"]:
+                self.health[asset]['status'] = 'healthy'
+                self.health[asset]['last_check'] = asyncio.get_event_loop().time()
+                self.health[asset]['last_hold_reason'] = news["reason"][:120]
+                logger.info(f"HEARTBEAT [{asset}] cycle complete | HOLD (news gate): {news['reason']}")
+                return {"asset": asset, "signal": "HOLD", "reason": news["reason"]}
 
             signal_type = result["signal"]
             current_price = result["entry_price"]
@@ -505,6 +544,7 @@ class CloudForexEngine:
             lines.append(f"⚠️ 15m layer's own signal is {ctx.get('primary_signal')} — AGAINST this {signal_type}")
         if ctx.get("range_chop"):
             lines.append("⚠️ Range chop (whipsaw) flagged — trend signals fail more often here")
+        lines.extend(ctx.get("smc_lines") or [])
         return lines
 
     async def _send_outcome_notification(self, record: dict):
@@ -570,6 +610,7 @@ class CloudForexEngine:
             )
         asyncio.create_task(self._keep_alive_ping())
         asyncio.create_task(self._summary_heartbeat_loop())
+        asyncio.create_task(self._news_loop())
         for asset in self.assets_config:
             self.tasks[asset] = asyncio.create_task(self.monitor_asset(asset))
             await asyncio.sleep(2)
@@ -779,6 +820,16 @@ async def telegram_webhook(request: Request):
             logger.warning(f"LIVE ACCEPT BLOCKED (LIVE_TRADING_ENABLED off): {signal_id}")
             return {"ok": True}
 
+        news = engine.news_gate.status()
+        if news["no_new_trades"]:
+            await engine.notification_manager.answer_callback(
+                callback_id, "News blackout — LIVE trade NOT queued", show_alert=True)
+            if chat_id and message_id:
+                await engine.notification_manager.edit_message_reply_markup(
+                    chat_id, message_id, text=f"⏸ NOT queued — {news['reason']}\n\n(signal: {signal_id})")
+            logger.warning(f"LIVE ACCEPT BLOCKED (news): {signal_id} | {news['reason']}")
+            return {"ok": True}
+
         if not redis_client:
             await engine.notification_manager.answer_callback(callback_id, "Redis unavailable — can't queue trade")
             return {"ok": True}
@@ -837,6 +888,13 @@ async def get_pending_trade(account: str = "demo"):
     """
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available")
+
+    # v5.9.0: during/just before news, hand nothing out. The queued trade is left
+    # untouched — if it's still waiting once the news is over it will be older than
+    # the expiry limit and get discarded, never executed into post-news chaos.
+    _eng = app_state.get('engine')
+    if account == "live" and _eng and _eng.news_gate.status()["no_new_trades"]:
+        return {}
 
     timeout_minutes = float(os.getenv("EXEC_QUEUE_TIMEOUT_MINUTES", "15"))
     engine = app_state.get('engine')
@@ -915,6 +973,15 @@ async def trade_executed(request: Request):
     if engine and engine.notification_manager:
         await engine.notification_manager.send_test_message(msg)
     return {"ok": True}
+
+
+@app.get("/api/news_status")
+async def news_status():
+    """Polled by the EA (about every 20 s). Also handy to open in a browser to see what the bot thinks."""
+    engine = app_state.get('engine')
+    if not engine:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    return engine.news_gate.status()
 
 
 @app.get("/api/stats")

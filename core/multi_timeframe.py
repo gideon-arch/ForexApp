@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from .technical_analysis import TechnicalAnalyzer
+from .smc_zones import analyze_smc
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +316,17 @@ class MultiTimeframeEngine:
             except Exception as e:
                 logger.error(f"{pair} [{layer}] fetch error: {e}")
                 return None
+
+        # v5.9.0: 1H candles for CRT. Nice-to-have only — if this fetch fails the
+        # signal still goes out, just without the CRT line.
+        htf_df = None
+        try:
+            if source == "deriv":
+                htf_df = await data_feed.fetch_latest(pair=pair, timeframe=3600, source="deriv", deriv_symbol=pair)
+            else:
+                htf_df = await data_feed.fetch_latest(pair=pair, timeframe="1h", source="kraken")
+        except Exception as e:
+            logger.warning(f"{pair} 1H fetch for CRT failed (non-fatal): {e}")
 
         # Analyze each timeframe
         analyses = {}
@@ -712,6 +724,15 @@ class MultiTimeframeEngine:
         # formats it (see notifications.py's matching fix).
         decimals = 5 if entry_price < 50 else 2
 
+        # v5.9.0: support/resistance, order blocks, supply/demand and CRT.
+        # CONFIRMATIONS ONLY — shown on the alert and recorded for stats, they
+        # can never block or create a trade (rules are written in smc_zones.py).
+        smc_features, smc_lines = {}, []
+        try:
+            smc_features, smc_lines = analyze_smc(frames["secondary"], htf_df, trend_direction)
+        except Exception as e:
+            logger.warning(f"{pair} SMC analysis skipped (non-fatal): {e}")
+
         return {
             "pair": pair,
             "signal": trend_direction,
@@ -747,13 +768,14 @@ class MultiTimeframeEngine:
                 entry=entry, entry_signal=entry_signal,
                 trend_direction=trend_direction, entry_price=entry_price,
                 stop_loss=stop_loss, adx=adx,
-                reversal_override=reversal_override, early_trend_start=early_trend_start
+                reversal_override=reversal_override, early_trend_start=early_trend_start,
+                smc=smc_features, smc_lines=smc_lines
             )
         }
 
     def _build_context(self, *, primary_signal, primary_trend, secondary, secondary_signal,
                        entry, entry_signal, trend_direction, entry_price, stop_loss, adx,
-                       reversal_override, early_trend_start) -> dict:
+                       reversal_override, early_trend_start, smc=None, smc_lines=None) -> dict:
         """
         v5.8.0: snapshot of WHY this signal fired, stored with the outcome so
         win rate can later be sliced by feature (/api/stats?breakdown=true)
@@ -778,6 +800,8 @@ class MultiTimeframeEngine:
             "adx": round(float(adx), 1),
             "reversal_override": bool(reversal_override),
             "early_trend_start": bool(early_trend_start),
+            "smc": smc or {},
+            "smc_lines": smc_lines or [],
         }
 
     def _summarize_layers(self, analyses: dict) -> dict:

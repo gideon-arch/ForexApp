@@ -15,13 +15,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import re
 import sys
 import asyncio
 import redis.asyncio as redis
 import json
 import logging
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -32,6 +33,7 @@ from core.filters import FilterManager
 from core.notifications import NotificationManager, SignalAlert
 from core.outcome_tracker import OutcomeTracker
 from core.news_gate import NewsGate
+from core.news_breakout import evaluate as nb_evaluate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +47,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.9.0"
+APP_VERSION = "5.10.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -118,6 +120,20 @@ class CloudForexEngine:
         self.mtf_engine = MultiTimeframeEngine()
         self.outcome_tracker = OutcomeTracker(redis_client)
         self.news_gate = NewsGate(redis_client)
+        # v5.10.0: post-news breakout setup. ALERT-ONLY by design — there is no code path from
+        # here to the execution queue. Results are tracked under their own setup name.
+        self.nb_enabled = os.getenv("NEWS_BREAKOUT_ENABLED", "true").lower() == "true"
+        self.nb_keywords = [k.strip() for k in os.getenv("NEWS_BREAKOUT_KEYWORDS", "CPI").split(",") if k.strip()]
+        self.nb_assets = [a.strip() for a in os.getenv("NEWS_BREAKOUT_ASSETS", "BTCUSD,EURUSD,frxXAUUSD").split(",") if a.strip()]
+        self.nb_params = dict(
+            min_range_atr=float(os.getenv("NEWS_BREAKOUT_MIN_RANGE_ATR", "2.0")),
+            buffer_atr=float(os.getenv("NEWS_BREAKOUT_BUFFER_ATR", "0.1")),
+            max_chase_atr=float(os.getenv("NEWS_BREAKOUT_MAX_CHASE_ATR", "1.0")),
+            max_risk_atr=float(os.getenv("NEWS_BREAKOUT_MAX_RISK_ATR", "3.0")),
+            max_age_min=float(os.getenv("NEWS_BREAKOUT_MAX_ALERT_AGE_MIN", "3")),
+            watch_min=float(os.getenv("NEWS_BREAKOUT_WATCH_MINUTES", "60")),
+        )
+        self._nb_done = set()
 
         # ===== MORNING-BIRD: faster checks during the morning window =====
         self.morning_start_utc = int(os.getenv("MORNING_BOOST_START_UTC", "6"))
@@ -191,8 +207,7 @@ class CloudForexEngine:
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.5.3: Reversal override fix (stale-trend BUY/SELL lock) "
-                "+ EURUSD/Gold removed — BTC-only\n"
+                "🆕 v5.10.0: CPI post-news breakout (alert-only) + news blackout + SMC confirmations\n"
                 f"⚙️ Version: {APP_VERSION}"
             )
             logger.info("Startup message sent")
@@ -262,12 +277,121 @@ class CloudForexEngine:
                         warned_at = now
                         await self.notification_manager.send_test_message("⚠️ NEWS CALENDAR UNAVAILABLE\n" + st["reason"])
                 else:
+                    if warned_at is not None:
+                        await self.notification_manager.send_test_message("✅ News calendar loaded — news protection is back on")
                     warned_at = None
                 for text in await self.news_gate.pop_due_notices():
                     await self.notification_manager.send_test_message(text)
             except Exception as e:
                 logger.error(f"News loop error: {e}")
             await asyncio.sleep(30)
+
+    async def _cpi_loop(self):
+        """v5.10.0: post-news breakout watcher (ALERT-ONLY). Does nothing except for the
+        watch window right after a matching release (default: CPI), then polls 1m candles."""
+        if not self.nb_enabled:
+            logger.info("Post-news breakout watcher disabled (NEWS_BREAKOUT_ENABLED=false)")
+            return
+        await asyncio.sleep(45)
+        while app_state['is_running']:
+            try:
+                await self._cpi_tick()
+            except Exception as e:
+                logger.error(f"Post-news breakout loop error: {e}")
+            await asyncio.sleep(30)
+
+    async def _cpi_tick(self):
+        gate = self.news_gate
+        now = datetime.now(timezone.utc)
+        if not (self.nb_enabled and gate.enabled and gate.is_data_ok(now)):
+            return
+        after = timedelta(minutes=gate.after)
+        watch = timedelta(minutes=self.nb_params["watch_min"] + 5)
+        clusters = []
+        for kw in self.nb_keywords:                           # one pass per keyword, so CPI and PPI never merge
+            for c in gate.clusters_matching([kw]):
+                clusters.append(dict(c, keyword=kw))
+        for cl in clusters:
+            t_end = cl["time"] + after                       # blackout over -> we may start looking
+            if not (t_end <= now <= t_end + watch):
+                continue
+            for asset in self.nb_assets:
+                cfg = self.assets_config.get(asset)
+                key = (cl["time"].isoformat(), asset)
+                if not cfg or key in self._nb_done:
+                    continue
+                if not cfg.get("market_24_7", True) and self._is_forex_market_closed():
+                    continue
+                tf = cfg["timeframes"]["entry"]
+                if cfg["source"] == "deriv":
+                    df = await self.data_feed.fetch_latest(pair=asset, timeframe=tf["deriv_granularity"], source="deriv", deriv_symbol=asset)
+                else:
+                    df = await self.data_feed.fetch_latest(pair=asset, timeframe=tf["tf"], source=cfg["source"])
+                res = nb_evaluate(df, cl["time"], gate.after, now, before_min=gate.before, **self.nb_params)
+                status = res["status"]
+                if status in ("waiting", "watching", "no_data"):
+                    continue                                  # keep watching
+                self._nb_done.add(key)                        # every other status is final for this release
+                if status == "breakout":
+                    await self._nb_alert(cl, asset, cfg, res)
+                else:
+                    reasons = {
+                        "fizzled": f"the news move was too small ({res.get('range_atr')}x ATR, needs {self.nb_params['min_range_atr']:g}x)",
+                        "late": "the breakout happened too long ago to act on",
+                        "chased": "the breakout candle closed too far past the level — not chasing it",
+                        "too_wide": "the news range was too wide for a sensible stop",
+                        "expired": f"no breakout within {self.nb_params['watch_min']:g} minutes",
+                    }
+                    why = reasons.get(status, status)
+                    logger.info(f"POST-NEWS [{asset}] {cl['title']}: no setup — {why}")
+                    if "BTC" in asset.upper():
+                        await self.notification_manager.send_test_message(f"📰 {cl['title']} watch ({cfg.get('display_name', asset)}): no setup — {why}.")
+
+    async def _nb_alert(self, cl, asset, cfg, res):
+        if self.news_gate.status()["no_new_trades"]:
+            logger.info(f"POST-NEWS [{asset}] breakout skipped: another high-impact event is close")
+            return
+        if not await self.news_gate._first_time(f"cpi:alerted:{cl['time'].isoformat()}:{asset}", ttl=3 * 86400):
+            return                                            # already alerted for this release (e.g. after a restart)
+        display = cfg.get("display_name", asset)
+        await self.outcome_tracker.record_signal({
+            "asset": asset, "display_name": display, "signal": res["direction"],
+            "entry_price": res["entry"], "stop_loss": res["sl"], "take_profit": res["tp"],
+            "confidence": 0.0, "is_early": False, "setup": self._nb_setup(cl["keyword"]),
+            "timestamp": datetime.utcnow().isoformat(),
+            "context": {"event": cl["title"], "range_atr": res["range_atr"], "first_move": res["first_move"],
+                        "with_first_move": res["with_first_move"], "range_high": res["range_high"],
+                        "range_low": res["range_low"], "atr_5m": res["atr"], "level": res["level"]},
+        })
+        logger.info(f"POST-NEWS [{asset}] {res['direction']} breakout recorded (alert-only) | {cl['title']}")
+        if "BTC" in asset.upper():                            # same BTC-only Telegram rule as everything else
+            await self.notification_manager.send_test_message(self._nb_text(display, cl, res))
+
+    @staticmethod
+    def _nb_setup(keyword: str) -> str:
+        """One tag per keyword: CPI -> CPI_BREAKOUT, PPI -> PPI_BREAKOUT, Non-Farm -> NON_FARM_BREAKOUT."""
+        return re.sub(r"[^A-Z0-9]+", "_", keyword.upper()).strip("_") + "_BREAKOUT"
+
+    def _nb_text(self, display, cl, res) -> str:
+        def px(v):
+            return f"{v:,.2f}" if v >= 100 else f"{v:,.5f}"
+        side = "🟢 BUY" if res["direction"] == "BUY" else "🔴 SELL"
+        rel = "WITH" if res["with_first_move"] else "AGAINST"
+        return (
+            f"📰 {cl['title']} — POST-NEWS BREAKOUT (ALERT ONLY)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧪 Not tradeable yet — tracking it to prove it first\n"
+            f"📊 {display} {side}\n"
+            f"🎯 Entry ≈ {px(res['entry'])}\n"
+            f"🛑 SL: {px(res['sl'])}  (middle of the news range)\n"
+            f"💰 TP: {px(res['tp'])}  (2R)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Released {cl['time']:%H:%M} UTC | range {px(res['range_low'])} – {px(res['range_high'])} ({res['range_atr']}x ATR)\n"
+            f"First move was {res['first_move']}; this breakout goes {rel} it\n"
+            f"Broke out at {res['breakout_close_time'][11:16]} UTC\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 AI Bot v{APP_VERSION} | stats: /api/stats?setup={self._nb_setup(cl['keyword'])}"
+        )
 
     async def _summary_heartbeat_loop(self):
         """Sends a status summary to Telegram every SUMMARY_INTERVAL_HOURS."""
@@ -571,10 +695,13 @@ class CloudForexEngine:
                 emoji = "❌"
                 result_line = f"LOSS — SL hit @ {record['close_price']:,.5f} ({record['r_multiple']:+.2f}R)"
 
+            _setup = record.get("setup", "MAIN")
+            setup_line = "" if _setup == "MAIN" else f"🏷 {_setup.replace('_BREAKOUT', '').replace('_', ' ')} post-news breakout (alert-only, tracking)\n"
             msg = (
                 f"{emoji} SIGNAL RESOLVED\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📊 {record['display_name']} {record['direction']}\n"
+                f"{setup_line}"
                 f"Entry: {record['entry_price']:,.5f}\n"
                 f"{result_line}\n"
                 f"Opened: {record['opened_at'][11:16]} UTC | "
@@ -611,6 +738,7 @@ class CloudForexEngine:
         asyncio.create_task(self._keep_alive_ping())
         asyncio.create_task(self._summary_heartbeat_loop())
         asyncio.create_task(self._news_loop())
+        asyncio.create_task(self._cpi_loop())
         for asset in self.assets_config:
             self.tasks[asset] = asyncio.create_task(self.monitor_asset(asset))
             await asyncio.sleep(2)
@@ -985,7 +1113,7 @@ async def news_status():
 
 
 @app.get("/api/stats")
-async def get_stats(asset: str = None, since: str = None, breakdown: bool = False):
+async def get_stats(asset: str = None, since: str = None, breakdown: bool = False, setup: str = None):
     """
     Real win-rate / R-multiple stats from the outcome tracker — win_rate_pct,
     avg_r_multiple, wins/losses/expired, overall and broken down per asset.
@@ -1000,7 +1128,7 @@ async def get_stats(asset: str = None, since: str = None, breakdown: bool = Fals
         raise HTTPException(status_code=503, detail="Engine not initialized")
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available — stats require Redis")
-    return await engine.outcome_tracker.get_stats(asset=asset, since=since, breakdown=breakdown)
+    return await engine.outcome_tracker.get_stats(asset=asset, since=since, breakdown=breakdown, setup=setup)
 
 
 if __name__ == "__main__":

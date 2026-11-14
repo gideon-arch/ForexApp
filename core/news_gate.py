@@ -270,3 +270,19 @@ class NewsGate:
             if end <= now < end + timedelta(minutes=10) and await self._first_time(f"{tag}:ended"):
                 texts.append(f"✅ News blackout over ({ev['title']}). Signals resume.")
         return texts
+
+    # ---------------- helper for the post-news breakout setup ----------------
+    def clusters_matching(self, keywords: List[str], gap_min: float = 5.0) -> List[Dict]:
+        """Events whose title contains any keyword (case-insensitive). Releases within
+        gap_min of each other (CPI m/m + Core CPI + CPI y/y all drop at the same minute)
+        become ONE cluster, timed at the first of them."""
+        kws = [k.lower() for k in keywords if k]
+        evs = sorted((e for e in self.events if any(k in e["title"].lower() for k in kws)), key=lambda e: e["time"])
+        clusters: List[Dict] = []
+        for e in evs:
+            if clusters and (e["time"] - clusters[-1]["last"]) <= timedelta(minutes=gap_min):
+                clusters[-1]["titles"].append(e["title"])
+                clusters[-1]["last"] = e["time"]
+            else:
+                clusters.append({"time": e["time"], "last": e["time"], "titles": [e["title"]]})
+        return [{"time": c["time"], "title": " + ".join(dict.fromkeys(c["titles"]))} for c in clusters]

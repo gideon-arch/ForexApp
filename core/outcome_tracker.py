@@ -64,6 +64,7 @@ class OutcomeTracker:
                 "confidence": signal_data["confidence"],
                 "is_early": signal_data.get("is_early", False),
                 "context": signal_data.get("context") or {},
+                "setup": signal_data.get("setup", "MAIN"),
                 "opened_at": signal_data["timestamp"],
                 "status": "OPEN",
                 "closed_at": None,
@@ -160,7 +161,7 @@ class OutcomeTracker:
         await self.redis.ltrim(self._closed_list_key(asset), 0, 499)  # keep last 500/asset
 
     async def get_stats(self, asset: Optional[str] = None, since: Optional[str] = None,
-                        breakdown: bool = False) -> Dict:
+                        breakdown: bool = False, setup: Optional[str] = None) -> Dict:
         """
         Win rate / avg R, overall or for one asset.
         `since`: optional ISO date/datetime string (e.g. "2026-10-04" or a
@@ -193,12 +194,19 @@ class OutcomeTracker:
                     rec = json.loads(raw)
                     if since_dt is not None and pd.to_datetime(rec["opened_at"]) < since_dt:
                         continue
+                    # v5.10.0: other setups (e.g. CPI_BREAKOUT) are tracked separately so they
+                    # never mix into the main strategy's win rate. setup=all shows everything.
+                    rec_setup = rec.get("setup", "MAIN")
+                    if setup is None and rec_setup != "MAIN":
+                        continue
+                    if setup not in (None, "all") and rec_setup != setup:
+                        continue
                     records.append(rec)
             per_asset[a] = self._summarize(records)
             all_records.extend(records)
 
         overall = self._summarize(all_records)
-        result = {"enabled": True, "overall": overall, "by_asset": per_asset}
+        result = {"enabled": True, "setup": setup or "MAIN", "overall": overall, "by_asset": per_asset}
         if since:
             result["since"] = since
         if breakdown:
@@ -297,7 +305,11 @@ class OutcomeTracker:
             n = smc.get("confirmations", 0)
             return "a) 0 of 4" if n == 0 else ("b) 1 of 4" if n == 1 else ("c) 2 of 4" if n == 2 else "d) 3-4 of 4"))
 
+        extra = {}
+        if any("with_first_move" in (r.get("context") or {}) for r in records):
+            extra["breakout_with_vs_against_first_move"] = self._slice(records, flag("with_first_move"))
         return {
+            **extra,
             "smc_confirmations": self._slice(records, smc_count),
             "in_order_block": self._slice(records, smc_flag("ob_aligned")),
             "in_supply_demand_zone": self._slice(records, smc_flag("sd_aligned")),

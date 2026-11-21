@@ -715,6 +715,33 @@ class MultiTimeframeEngine:
             else:
                 logger.warning(f"{pair} FIXED-$ SIZING skipped — no contract size match, using ATR-based levels")
 
+        # ===== v5.12.0: SUPPORT / RESISTANCE ENTRY RULE =====
+        # Every entry must be sitting on a level: a BUY needs a support (a level with 2+
+        # touches under price), a SELL needs a resistance, within SR_ENTRY_MAX_ATR (default
+        # 0.5) of price. Runs BEFORE record_signal so a blocked signal never counts as
+        # "already sent" for the duplicate guard. Switch off: REQUIRE_SR_ENTRY=false.
+        # (Order blocks, supply/demand and CRT stay confirmations only.)
+        price_proxy = any("proxy" in str(getattr(frames.get(k), "attrs", {}).get("price_source", "")).lower()
+                          for k in ("primary", "secondary", "entry"))
+        smc_features, smc_lines = {}, []
+        try:
+            smc_features, smc_lines = analyze_smc(frames["secondary"], htf_df, trend_direction)
+        except Exception as e:
+            logger.warning(f"{pair} SMC analysis skipped (non-fatal): {e}")
+        if os.getenv("REQUIRE_SR_ENTRY", "true").lower() == "true":
+            sr_ok, sr_why = self._sr_entry_ok(smc_features, trend_direction,
+                                              float(os.getenv("SR_ENTRY_MAX_ATR", "0.5")))
+            if not sr_ok:
+                logger.info(f"{pair} {trend_direction} held back by S/R entry rule: {sr_why}")
+                return {
+                    "pair": pair, "signal": "HOLD",
+                    "reason": f"S/R entry rule: {sr_why}",
+                    "volatility_passed": True,
+                    "secondary_indicators": secondary,
+                    "secondary_df": frames["secondary"],
+                    "layers": self._summarize_layers(analyses)
+                }
+
         self.signal_tracker.record_signal(pair, trend_direction, setup_hash, entry_price)
 
         # v5.4.3: decimals must scale with the price's own magnitude — a flat
@@ -724,14 +751,7 @@ class MultiTimeframeEngine:
         # formats it (see notifications.py's matching fix).
         decimals = 5 if entry_price < 50 else 2
 
-        # v5.9.0: support/resistance, order blocks, supply/demand and CRT.
-        # CONFIRMATIONS ONLY — shown on the alert and recorded for stats, they
-        # can never block or create a trade (rules are written in smc_zones.py).
-        smc_features, smc_lines = {}, []
-        try:
-            smc_features, smc_lines = analyze_smc(frames["secondary"], htf_df, trend_direction)
-        except Exception as e:
-            logger.warning(f"{pair} SMC analysis skipped (non-fatal): {e}")
+        # (support/resistance, order blocks, supply/demand and CRT are computed above, before the signal is recorded)
 
         return {
             "pair": pair,
@@ -769,13 +789,25 @@ class MultiTimeframeEngine:
                 trend_direction=trend_direction, entry_price=entry_price,
                 stop_loss=stop_loss, adx=adx,
                 reversal_override=reversal_override, early_trend_start=early_trend_start,
-                smc=smc_features, smc_lines=smc_lines
+                smc=smc_features, smc_lines=smc_lines, price_proxy=price_proxy
             )
         }
 
+    @staticmethod
+    def _sr_entry_ok(smc: dict, direction: str, max_atr: float):
+        """(allowed, reason). BUY needs a support, SELL needs a resistance, within max_atr x ATR."""
+        kind = "support" if direction == "BUY" else "resistance"
+        if not smc or not smc.get("available"):
+            return False, f"can't check for a {kind} (not enough candles) — entry location unconfirmed"
+        if not smc.get("sr_aligned") or smc.get("sr_dist_atr") is None:
+            return False, f"no {kind} level (2+ touches) within 1x ATR — price is in the middle of nowhere"
+        if smc["sr_dist_atr"] > max_atr:
+            return False, f"nearest {kind} {smc['sr_level']:,.2f} is {smc['sr_dist_atr']:.1f}x ATR away (needs {max_atr:g}x or less)"
+        return True, ""
+
     def _build_context(self, *, primary_signal, primary_trend, secondary, secondary_signal,
                        entry, entry_signal, trend_direction, entry_price, stop_loss, adx,
-                       reversal_override, early_trend_start, smc=None, smc_lines=None) -> dict:
+                       reversal_override, early_trend_start, smc=None, smc_lines=None, price_proxy=False) -> dict:
         """
         v5.8.0: snapshot of WHY this signal fired, stored with the outcome so
         win rate can later be sliced by feature (/api/stats?breakdown=true)
@@ -802,6 +834,7 @@ class MultiTimeframeEngine:
             "early_trend_start": bool(early_trend_start),
             "smc": smc or {},
             "smc_lines": smc_lines or [],
+            "price_proxy": bool(price_proxy),
         }
 
     def _summarize_layers(self, analyses: dict) -> dict:

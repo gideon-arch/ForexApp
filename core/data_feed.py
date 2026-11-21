@@ -127,6 +127,7 @@ class DataFeedManager:
                     tried.append("kraken(PAXG-proxy)")
                     if df is not None:
                         logger.warning(f"⚠️ Using PAXG/USD as a gold PROXY for {pair} — Deriv unavailable, prices may drift slightly from spot")
+                        df.attrs["price_source"] = "PAXG-proxy"   # v5.11.0: lets the alert warn about it
                 except Exception as e:
                     logger.error(f"Kraken PAXG fallback failed: {e}")
 

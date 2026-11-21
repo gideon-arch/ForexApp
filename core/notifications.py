@@ -21,6 +21,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def telegram_allows(pair: str) -> bool:
+    """Which assets may reach Telegram. Set TELEGRAM_ALERT_ASSETS on Render as a comma list of
+    name fragments, e.g. BTC,XAU (default) or BTC,XAU,EUR. Matches 'BTCUSD', 'XAUUSD', 'frxXAUUSD'."""
+    raw = os.getenv("TELEGRAM_ALERT_ASSETS") or ""
+    tokens = [t.strip().upper() for t in raw.split(",") if t.strip()] or ["BTC", "XAU"]   # blank = default, never "mute everything"
+    p = (pair or "").upper()
+    return any(t in p for t in tokens)
+
+
 class SignalAlert:
     def __init__(self, pair: str, signal: str, entry_price: float, confidence: float,
                  timestamp: datetime, reasoning: str, stop_loss: float,
@@ -81,6 +90,7 @@ class NotificationManager:
         self.enabled = bool(self.bot_token and self.chat_id)
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_alert_time: Optional[datetime] = None
+        self._last_alert_by_pair: Dict[str, datetime] = {}   # v5.11.0: rate limit is per asset, so BTC can't swallow a Gold alert
         self.min_alert_interval = 15
         self.version = version
         logger.info(f"NotificationManager v{self.version} | Enabled: {self.enabled}")
@@ -103,18 +113,20 @@ class NotificationManager:
         # all three pairs exactly as before, so EUR/Gold stats keep building
         # in the background (check /api/stats any time) — they just don't
         # reach your phone anymore.
-        if "BTC" not in alert.pair.upper():
-            logger.info(f"Telegram alert suppressed (BTC-only mode): {alert.pair} {alert.signal}")
+        # v5.11.0: the allow-list is now the TELEGRAM_ALERT_ASSETS setting (default BTC + Gold).
+        if not telegram_allows(alert.pair):
+            logger.info(f"Telegram alert suppressed (not in TELEGRAM_ALERT_ASSETS): {alert.pair} {alert.signal}")
             return False
 
         if not self.enabled:
             logger.warning("Telegram not configured")
             return False
 
-        if self.last_alert_time:
-            elapsed = (datetime.utcnow() - self.last_alert_time).total_seconds()
+        last_for_pair = self._last_alert_by_pair.get(alert.pair)
+        if last_for_pair:
+            elapsed = (datetime.utcnow() - last_for_pair).total_seconds()
             if elapsed < self.min_alert_interval:
-                logger.info(f"Rate limited: {elapsed:.0f}s since last alert")
+                logger.info(f"Rate limited: {elapsed:.0f}s since last {alert.pair} alert")
                 return False
 
         message = self._format_alert_message(alert)
@@ -145,6 +157,7 @@ class NotificationManager:
         success = await self._send_telegram_message(message, parse_mode="HTML", reply_markup=reply_markup)
         if success:
             self.last_alert_time = datetime.utcnow()
+            self._last_alert_by_pair[alert.pair] = self.last_alert_time
         return success
 
     def _price_decimals(self, price: float) -> int:

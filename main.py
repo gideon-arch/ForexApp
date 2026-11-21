@@ -30,7 +30,7 @@ from contextlib import asynccontextmanager
 from core.data_feed import DataFeedManager
 from core.multi_timeframe import MultiTimeframeEngine
 from core.filters import FilterManager
-from core.notifications import NotificationManager, SignalAlert
+from core.notifications import NotificationManager, SignalAlert, telegram_allows
 from core.outcome_tracker import OutcomeTracker
 from core.news_gate import NewsGate
 from core.news_breakout import evaluate as nb_evaluate
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.10.0"
+APP_VERSION = "5.12.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -201,13 +201,13 @@ class CloudForexEngine:
             await self.notification_manager.send_test_message(
                 "🤖 AI Crypto Bot v" + APP_VERSION + " is ONLINE!\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
-                "✅ Assets: BTCUSD + EURUSD + XAUUSD (all tracked) | 📵 Telegram alerts: BTC only\n"
+                "✅ Assets: BTCUSD + EURUSD + XAUUSD (all tracked) | 📲 Telegram alerts: " + (os.getenv("TELEGRAM_ALERT_ASSETS") or "BTC,XAU") + "\n"
                 "📐 15m → 5m → 1m for all\n"
                 "🎯 Exact Entry + TP + SL\n"
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.10.0: CPI post-news breakout (alert-only) + news blackout + SMC confirmations\n"
+                "🆕 v5.12.0: entries only at support/resistance + Gold alerts + CPI/PPI breakout (alert-only)\n"
                 f"⚙️ Version: {APP_VERSION}"
             )
             logger.info("Startup message sent")
@@ -344,7 +344,7 @@ class CloudForexEngine:
                     }
                     why = reasons.get(status, status)
                     logger.info(f"POST-NEWS [{asset}] {cl['title']}: no setup — {why}")
-                    if "BTC" in asset.upper():
+                    if telegram_allows(asset):
                         await self.notification_manager.send_test_message(f"📰 {cl['title']} watch ({cfg.get('display_name', asset)}): no setup — {why}.")
 
     async def _nb_alert(self, cl, asset, cfg, res):
@@ -364,7 +364,7 @@ class CloudForexEngine:
                         "range_low": res["range_low"], "atr_5m": res["atr"], "level": res["level"]},
         })
         logger.info(f"POST-NEWS [{asset}] {res['direction']} breakout recorded (alert-only) | {cl['title']}")
-        if "BTC" in asset.upper():                            # same BTC-only Telegram rule as everything else
+        if telegram_allows(asset):                            # same Telegram allow-list as everything else
             await self.notification_manager.send_test_message(self._nb_text(display, cl, res))
 
     @staticmethod
@@ -668,6 +668,8 @@ class CloudForexEngine:
             lines.append(f"⚠️ 15m layer's own signal is {ctx.get('primary_signal')} — AGAINST this {signal_type}")
         if ctx.get("range_chop"):
             lines.append("⚠️ Range chop (whipsaw) flagged — trend signals fail more often here")
+        if ctx.get("price_proxy"):
+            lines.append("⚠️ Price is from the PAXG stand-in feed (Deriv is down) — it can differ from your broker's gold price. Check your chart before accepting")
         lines.extend(ctx.get("smc_lines") or [])
         return lines
 
@@ -680,8 +682,8 @@ class CloudForexEngine:
         # through even though new EUR/Gold signals were correctly silenced.
         # Same filter, applied here too. EUR/Gold still track normally in
         # the background either way — check /api/stats any time.
-        if "BTC" not in record.get("asset", "").upper():
-            logger.info(f"Outcome notification suppressed (BTC-only mode): {record.get('asset')} {record.get('status')}")
+        if not telegram_allows(record.get("asset", "")):
+            logger.info(f"Outcome notification suppressed (not in TELEGRAM_ALERT_ASSETS): {record.get('asset')} {record.get('status')}")
             return
         try:
             status = record["status"]

@@ -231,7 +231,8 @@ def _fmt(x: float) -> str:
 
 _EMPTY = {"available": False, "confirmations": 0, "sr_aligned": False, "ob_aligned": False,
           "sd_aligned": False, "crt_aligned": False, "crt_state": None, "crt_zone": None,
-          "obstacle_atr": None, "obstacle_near": False}
+          "obstacle_atr": None, "obstacle_near": False,
+          "sr_level": None, "sr_dist_atr": None, "sr_touches": None}
 
 
 def analyze_smc(df_ltf: Optional[pd.DataFrame], df_htf: Optional[pd.DataFrame],
@@ -314,6 +315,10 @@ def analyze_smc(df_ltf: Optional[pd.DataFrame], df_htf: Optional[pd.DataFrame],
             "crt_zone": crt_zone,
             "obstacle_atr": obstacle_atr,
             "obstacle_near": obstacle_near,
+            # v5.12.0: the nearest level on the trade's side, so the entry rule can check distance
+            "sr_level": (round(sr["price"], 5) if sr is not None else None),
+            "sr_dist_atr": (round(abs(price - sr["price"]) / a, 2) if sr is not None else None),
+            "sr_touches": (sr["touches"] if sr is not None else None),
         }
 
         lines = [f"🔎 SMC confirmations: {feats['confirmations']}/4"]

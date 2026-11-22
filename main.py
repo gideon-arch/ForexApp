@@ -34,6 +34,7 @@ from core.notifications import NotificationManager, SignalAlert, telegram_allows
 from core.outcome_tracker import OutcomeTracker
 from core.news_gate import NewsGate
 from core.news_breakout import evaluate as nb_evaluate
+from core.gainz_arbm import evaluate as gz_arbm_evaluate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.12.0"
+APP_VERSION = "5.13.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -134,6 +135,19 @@ class CloudForexEngine:
             watch_min=float(os.getenv("NEWS_BREAKOUT_WATCH_MINUTES", "60")),
         )
         self._nb_done = set()
+        # v5.13.0: ports of GainzAlgo indicators. ALERT-ONLY (no buttons, no execution queue);
+        # each one is tracked under its own tag GAINZ_<NAME> and never mixes into the main stats.
+        self.gz_enabled = os.getenv("GAINZ_ENABLED", "true").lower() == "true"
+        self.gz_strategies = [s.strip().upper() for s in os.getenv("GAINZ_STRATEGIES", "ARBM").split(",") if s.strip()]
+        self.gz_assets = [a.strip() for a in os.getenv("GAINZ_ASSETS", "BTCUSD").split(",") if a.strip()]
+        self.gz_tf = os.getenv("GAINZ_TIMEFRAME", "15m")
+        self.gz_arbm_tp = os.getenv("GAINZ_ARBM_TP", "TP2")
+        self.gz_params = dict(
+            max_age_min=float(os.getenv("GAINZ_MAX_AGE_MIN", "10")),
+            min_risk_atr=float(os.getenv("GAINZ_MIN_RISK_ATR", "0.3")),
+            max_risk_atr=float(os.getenv("GAINZ_MAX_RISK_ATR", "4.0")),
+        )
+        self._gz_seen = {}
 
         # ===== MORNING-BIRD: faster checks during the morning window =====
         self.morning_start_utc = int(os.getenv("MORNING_BOOST_START_UTC", "6"))
@@ -207,7 +221,7 @@ class CloudForexEngine:
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.12.0: entries only at support/resistance + Gold alerts + CPI/PPI breakout (alert-only)\n"
+                "🆕 v5.13.0: GainzAlgo ARBM signals (alert-only) + S/R entries + Gold alerts + CPI/PPI breakout\n"
                 f"⚙️ Version: {APP_VERSION}"
             )
             logger.info("Startup message sent")
@@ -391,6 +405,92 @@ class CloudForexEngine:
             f"Broke out at {res['breakout_close_time'][11:16]} UTC\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 AI Bot v{APP_VERSION} | stats: /api/stats?setup={self._nb_setup(cl['keyword'])}"
+        )
+
+    async def _gainz_loop(self):
+        """v5.13.0: watches for new signals from the GainzAlgo indicator ports (ALERT-ONLY).
+        Cheap: it only recomputes when a new candle has closed."""
+        if not self.gz_enabled:
+            logger.info("GainzAlgo watcher disabled (GAINZ_ENABLED=false)")
+            return
+        await asyncio.sleep(60)
+        while app_state['is_running']:
+            try:
+                await self._gz_tick()
+            except Exception as e:
+                logger.error(f"GainzAlgo loop error: {e}")
+            await asyncio.sleep(60)
+
+    async def _gz_tick(self):
+        now = datetime.now(timezone.utc)
+        tf_min = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(self.gz_tf, 15)
+        for asset in self.gz_assets:
+            cfg = self.assets_config.get(asset)
+            if not cfg:
+                continue
+            if not cfg.get("market_24_7", True) and self._is_forex_market_closed():
+                continue
+            if cfg["source"] == "deriv":
+                df = await self.data_feed.fetch_latest(pair=asset, timeframe=tf_min * 60, source="deriv", deriv_symbol=asset)
+            else:
+                df = await self.data_feed.fetch_latest(pair=asset, timeframe=self.gz_tf, source=cfg["source"])
+            if df is None or len(df) < 3:
+                continue
+            bar_key = str(df["timestamp"].iloc[-2])               # the newest COMPLETED candle
+            for name in self.gz_strategies:
+                if self._gz_seen.get((name, asset)) == bar_key:
+                    continue                                       # this candle was already checked
+                if name == "ARBM":
+                    res = gz_arbm_evaluate(df, now, timeframe_min=tf_min, tp_pick=self.gz_arbm_tp, **self.gz_params)
+                else:
+                    logger.warning(f"GainzAlgo: unknown strategy '{name}' in GAINZ_STRATEGIES (ignored)")
+                    self._gz_seen[(name, asset)] = bar_key
+                    continue
+                if res["status"] == "no_data":
+                    continue                                       # try again next minute
+                self._gz_seen[(name, asset)] = bar_key
+                if res["status"] == "signal":
+                    await self._gz_alert(name, asset, cfg, res)
+                elif res["status"] != "no_event":
+                    logger.info(f"GAINZ {name} [{asset}] signal skipped: {res['status']} (risk {res.get('risk_atr')}x ATR, age {res.get('age_min')} min)")
+
+    async def _gz_alert(self, name, asset, cfg, res):
+        if self.news_gate.status()["no_new_trades"]:
+            logger.info(f"GAINZ {name} [{asset}] skipped: high-impact news window")
+            return
+        if not await self.news_gate._first_time(f"gainz:{name}:{asset}:{res['bar_ts']}", ttl=3 * 86400):
+            return                                                 # already sent (e.g. before a restart)
+        display = cfg.get("display_name", asset)
+        await self.outcome_tracker.record_signal({
+            "asset": asset, "display_name": display, "signal": res["direction"],
+            "entry_price": res["entry"], "stop_loss": res["sl"], "take_profit": res["tp"],
+            "confidence": 0.0, "is_early": False, "setup": f"GAINZ_{name}",
+            "timestamp": datetime.utcnow().isoformat(),
+            "context": {"strategy": name, "timeframe": self.gz_tf, "tp_pick": res["tp_pick"], "risk_atr": res["risk_atr"],
+                        "width_pct": res["width_pct"], "tp1": res["tp1"], "tp2": res["tp2"], "tp3": res["tp3"]},
+        })
+        logger.info(f"GAINZ {name} [{asset}] {res['direction']} recorded (alert-only)")
+        if telegram_allows(asset):
+            await self.notification_manager.send_test_message(self._gz_text(name, display, res))
+
+    def _gz_text(self, name, display, res) -> str:
+        def px(v):
+            return f"{v:,.2f}" if v >= 100 else f"{v:,.5f}"
+        side = "🟢 BUY" if res["direction"] == "BUY" else "🔴 SELL"
+        title = {"ARBM": "ARBM (regression breakout)"}.get(name, name)
+        return (
+            f"🧠 GAINZALGO {title} — ALERT ONLY\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧪 Tracking it first — not tradeable yet\n"
+            f"📊 {display} {side} ({self.gz_tf})\n"
+            f"🎯 Entry ≈ {px(res['entry'])}\n"
+            f"🛑 SL: {px(res['sl'])}  (the indicator's own stop)\n"
+            f"💰 TP: {px(res['tp'])}  ({res['tp_pick']})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(res["lines"]) + "\n"
+            f"Stop is {res['risk_atr']}x ATR away\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 AI Bot v{APP_VERSION} | stats: /api/stats?setup=GAINZ_{name}"
         )
 
     async def _summary_heartbeat_loop(self):
@@ -698,7 +798,12 @@ class CloudForexEngine:
                 result_line = f"LOSS — SL hit @ {record['close_price']:,.5f} ({record['r_multiple']:+.2f}R)"
 
             _setup = record.get("setup", "MAIN")
-            setup_line = "" if _setup == "MAIN" else f"🏷 {_setup.replace('_BREAKOUT', '').replace('_', ' ')} post-news breakout (alert-only, tracking)\n"
+            if _setup == "MAIN":
+                setup_line = ""
+            elif _setup.endswith("_BREAKOUT"):
+                setup_line = f"🏷 {_setup.replace('_BREAKOUT', '').replace('_', ' ')} post-news breakout (alert-only, tracking)\n"
+            else:
+                setup_line = f"🏷 {_setup.replace('_', ' ')} (alert-only, tracking)\n"
             msg = (
                 f"{emoji} SIGNAL RESOLVED\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -741,6 +846,7 @@ class CloudForexEngine:
         asyncio.create_task(self._summary_heartbeat_loop())
         asyncio.create_task(self._news_loop())
         asyncio.create_task(self._cpi_loop())
+        asyncio.create_task(self._gainz_loop())
         for asset in self.assets_config:
             self.tasks[asset] = asyncio.create_task(self.monitor_asset(asset))
             await asyncio.sleep(2)

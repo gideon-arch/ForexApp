@@ -35,6 +35,7 @@ from core.outcome_tracker import OutcomeTracker
 from core.news_gate import NewsGate
 from core.news_breakout import evaluate as nb_evaluate
 from core.gainz_arbm import evaluate as gz_arbm_evaluate
+from core.gainz_mlsmc import evaluate as gz_mlsmc_evaluate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 # reads from this constant instead of its own hardcoded copy — that
 # duplication is exactly what let the Telegram footer drift several
 # versions behind the rest of the bot, repeatedly.
-APP_VERSION = "5.13.0"
+APP_VERSION = "5.14.0"
 
 redis_url = os.getenv('REDIS_PUBLIC_URL', os.getenv('REDIS_URL', 'redis://localhost:6379'))
 try:
@@ -138,10 +139,14 @@ class CloudForexEngine:
         # v5.13.0: ports of GainzAlgo indicators. ALERT-ONLY (no buttons, no execution queue);
         # each one is tracked under its own tag GAINZ_<NAME> and never mixes into the main stats.
         self.gz_enabled = os.getenv("GAINZ_ENABLED", "true").lower() == "true"
-        self.gz_strategies = [s.strip().upper() for s in os.getenv("GAINZ_STRATEGIES", "ARBM").split(",") if s.strip()]
+        self.gz_strategies = [s.strip().upper() for s in os.getenv("GAINZ_STRATEGIES", "ARBM,MLSMC").split(",") if s.strip()]
         self.gz_assets = [a.strip() for a in os.getenv("GAINZ_ASSETS", "BTCUSD").split(",") if a.strip()]
         self.gz_tf = os.getenv("GAINZ_TIMEFRAME", "15m")
         self.gz_arbm_tp = os.getenv("GAINZ_ARBM_TP", "TP2")
+        self.gz_mlsmc_min_score = float(os.getenv("GAINZ_MLSMC_MIN_SCORE", "60"))
+        self.gz_mlsmc_min_matches = int(os.getenv("GAINZ_MLSMC_MIN_MATCHES", "5"))
+        self.gz_mlsmc_tp = os.getenv("GAINZ_MLSMC_TP", "2R")
+        self.gz_mlsmc_stop = os.getenv("GAINZ_MLSMC_STOP", "level")
         self.gz_params = dict(
             max_age_min=float(os.getenv("GAINZ_MAX_AGE_MIN", "10")),
             min_risk_atr=float(os.getenv("GAINZ_MIN_RISK_ATR", "0.3")),
@@ -221,7 +226,7 @@ class CloudForexEngine:
                 "🌅 Morning-bird boost active\n"
                 "💓 Status summary every "
                 f"{self.summary_interval_hours:g}h\n"
-                "🆕 v5.13.0: GainzAlgo ARBM signals (alert-only) + S/R entries + Gold alerts + CPI/PPI breakout\n"
+                "🆕 v5.14.0: GainzAlgo ARBM + ML Smart Money signals (alert-only) + S/R entries + Gold alerts + CPI/PPI\n"
                 f"⚙️ Version: {APP_VERSION}"
             )
             logger.info("Startup message sent")
@@ -442,6 +447,12 @@ class CloudForexEngine:
                     continue                                       # this candle was already checked
                 if name == "ARBM":
                     res = gz_arbm_evaluate(df, now, timeframe_min=tf_min, tp_pick=self.gz_arbm_tp, **self.gz_params)
+                elif name == "MLSMC":
+                    seeds = await self._gz_mlsmc_load(asset)
+                    res = gz_mlsmc_evaluate(df, now, timeframe_min=tf_min, seeds=seeds, tp_pick=self.gz_mlsmc_tp,
+                                            min_score=self.gz_mlsmc_min_score, min_matches=self.gz_mlsmc_min_matches,
+                                            stop_mode=self.gz_mlsmc_stop, **self.gz_params)
+                    await self._gz_mlsmc_save(asset, seeds, res.get("new_matured") or [], now, tf_min)
                 else:
                     logger.warning(f"GainzAlgo: unknown strategy '{name}' in GAINZ_STRATEGIES (ignored)")
                     self._gz_seen[(name, asset)] = bar_key
@@ -453,6 +464,32 @@ class CloudForexEngine:
                     await self._gz_alert(name, asset, cfg, res)
                 elif res["status"] != "no_event":
                     logger.info(f"GAINZ {name} [{asset}] signal skipped: {res['status']} (risk {res.get('risk_atr')}x ATR, age {res.get('age_min')} min)")
+
+    async def _gz_mlsmc_load(self, asset):
+        """Saved memory of past structure breaks (see core/gainz_mlsmc.py). Works without Redis, just with less memory."""
+        r = getattr(self.outcome_tracker, "redis", None)
+        if not r:
+            return []
+        try:
+            raw = await r.get(f"gainz:mlsmc:db:{asset}:{self.gz_tf}")
+            return json.loads(raw) if raw else []
+        except Exception as e:
+            logger.warning(f"GAINZ MLSMC [{asset}] couldn't load saved memory (starting from this run's candles only): {e}")
+            return []
+
+    async def _gz_mlsmc_save(self, asset, seeds, new, now, tf_min):
+        r = getattr(self.outcome_tracker, "redis", None)
+        if not r or not new:
+            return
+        try:
+            known = {(s["ts"], bool(s["bull"])) for s in seeds}
+            merged = list(seeds) + [m for m in new if (m["ts"], bool(m["bull"])) not in known]
+            cutoff = now.replace(tzinfo=None) - timedelta(minutes=tf_min * 1650)      # the indicator only looks 1500 bars back
+            merged = [m for m in merged if datetime.fromisoformat(m["ts"]) >= cutoff]
+            merged.sort(key=lambda m: m["ts"])
+            await r.set(f"gainz:mlsmc:db:{asset}:{self.gz_tf}", json.dumps(merged[-2000:]))
+        except Exception as e:
+            logger.warning(f"GAINZ MLSMC [{asset}] couldn't save memory: {e}")
 
     async def _gz_alert(self, name, asset, cfg, res):
         if self.news_gate.status()["no_new_trades"]:
@@ -466,8 +503,7 @@ class CloudForexEngine:
             "entry_price": res["entry"], "stop_loss": res["sl"], "take_profit": res["tp"],
             "confidence": 0.0, "is_early": False, "setup": f"GAINZ_{name}",
             "timestamp": datetime.utcnow().isoformat(),
-            "context": {"strategy": name, "timeframe": self.gz_tf, "tp_pick": res["tp_pick"], "risk_atr": res["risk_atr"],
-                        "width_pct": res["width_pct"], "tp1": res["tp1"], "tp2": res["tp2"], "tp3": res["tp3"]},
+            "context": {"strategy": name, "timeframe": self.gz_tf, "tp_pick": res["tp_pick"], "risk_atr": res["risk_atr"], **res.get("context", {})},
         })
         logger.info(f"GAINZ {name} [{asset}] {res['direction']} recorded (alert-only)")
         if telegram_allows(asset):
@@ -477,14 +513,14 @@ class CloudForexEngine:
         def px(v):
             return f"{v:,.2f}" if v >= 100 else f"{v:,.5f}"
         side = "🟢 BUY" if res["direction"] == "BUY" else "🔴 SELL"
-        title = {"ARBM": "ARBM (regression breakout)"}.get(name, name)
+        title = {"ARBM": "ARBM (regression breakout)", "MLSMC": "ML Smart Money (structure + memory)"}.get(name, name)
         return (
             f"🧠 GAINZALGO {title} — ALERT ONLY\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🧪 Tracking it first — not tradeable yet\n"
             f"📊 {display} {side} ({self.gz_tf})\n"
             f"🎯 Entry ≈ {px(res['entry'])}\n"
-            f"🛑 SL: {px(res['sl'])}  (the indicator's own stop)\n"
+            f"🛑 SL: {px(res['sl'])}  ({res.get('sl_note', 'the indicator' + chr(39) + 's own stop')})\n"
             f"💰 TP: {px(res['tp'])}  ({res['tp_pick']})\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             + "\n".join(res["lines"]) + "\n"

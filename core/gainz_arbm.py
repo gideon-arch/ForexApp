@@ -154,7 +154,8 @@ def evaluate(df: Optional[pd.DataFrame], now, *, timeframe_min: float, max_age_m
         return {**out, "status": "too_wide"}
     tp = ev[{"TP1": "tp1", "TP2": "tp2", "TP3": "tp3"}.get(tp_pick.upper(), "tp2")]
     side = "above the upper band" if ev["direction"] == "BUY" else "below the lower band"
-    out.update(status="signal", tp=float(tp), tp_pick=tp_pick.upper(),
+    out.update(status="signal", tp=float(tp), tp_pick=tp_pick.upper(), sl_note="the indicator's own stop",
+               context={"width_pct": ev["width_pct"], "tp1": ev["tp1"], "tp2": ev["tp2"], "tp3": ev["tp3"]},
                lines=[f"Squeeze breakout: closed {side} (channel was at the {ev['width_pct']:.0f}th percentile of its 100-bar width range)",
                       f"Indicator targets: TP1 {ev['tp1']:,.2f} | TP2 {ev['tp2']:,.2f} | TP3 {ev['tp3']:,.2f}"])
     return out
